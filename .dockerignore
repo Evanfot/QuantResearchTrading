@@ -1,0 +1,16 @@
+# Virtual env
+.venv/
+
+# dotenv environment variables file
+.env
+logs/
+config.json
+*.log
+.git
+.gitignore
+
+*.duckdb
+# State
+state/
+
+notes.md

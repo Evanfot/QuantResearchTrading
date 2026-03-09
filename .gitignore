@@ -1,3 +1,22 @@
+# Virtual env
+.venv/
+
+# dotenv environment variables file
+.env
+logs/
+config.json
+*.log
+.git/
+*.duckdb
+# State
+state/
+
+Notes.md
+.vscode/
+*.cache
+data/
+changelog.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -205,3 +224,22 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Virtual env
+.venv/
+
+# dotenv environment variables file
+.env
+logs/
+config.json
+*.log
+.git/
+*.duckdb
+# State
+state/
+
+Notes.md
+.vscode/
+*.cache
+data/
+changelog.md

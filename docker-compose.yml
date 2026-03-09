@@ -1,0 +1,14 @@
+services:
+  trader:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: trader
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./state:/app/state
+      - ./data:/app/data
+    command: python -m src.main
