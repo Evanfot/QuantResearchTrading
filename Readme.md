@@ -21,3 +21,7 @@ This project is a way to keep my market knowledge and Python skills sharp. As an
 1. **Accessibility**: The APIs and data are open 24/7. This allows for continuous testing and iteration outside of traditional working hours without any conflict of interest with my professional role.
 2. **Technical Complexity**: Perpetuals are a relatively new financial instrument and have unique mechanics like funding rates and Auto-Deleveraging (ADL). This project enabled me to learn first-hand how these mechanics work in practice.
 
+### Backtest output:
+- Generated 2026/03/11 using scripts.backtest
+- Output saved as ipynb in Examples
+![Backtest Output](assets/backtest_output.png)

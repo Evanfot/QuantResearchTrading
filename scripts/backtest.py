@@ -1,10 +1,23 @@
 
 # %%
+import sys
+from pathlib import Path
 import os
+
+root = Path().resolve()
+while not (root / "src").exists():
+    root = root.parent
+os.chdir(root)
+print("Working directory:", root)
+# %%
+
+from dataclasses import dataclass
+import sys
+from pathlib import Path
+
 import json
 import logging
 import pandas as pd
-from pathlib import Path
 import importlib
 from eth_account import Account
 from hyperliquid.exchange import Exchange
@@ -21,9 +34,7 @@ import requests
 import duckdb
 from dotenv import load_dotenv
 from decimal import Decimal, getcontext
-from typing import List, Dict
-import json
-from pathlib import Path
+from typing import List, Dict, Optional, Any
 from src.state.strategy_state import load_state, save_state, get_state_positions
 from src.loggers.intent_logger import (
     init_intent,
@@ -39,29 +50,24 @@ from scripts.meta_data import read_latest_meta
 from scripts.meta_data import get_hl_coins 
 from scripts.mkt_cap_data import get_latest_market_cap
 from src.ingestion.update_mids import run_update_mids
+from src.main import run_backtest, StrategyConfig
+from src.main import ewmac, breakout, scaled_bollinger, get_hyperliquid_trading_universe, db_path, get_ohlcv, get_final_pricing
 # %%
-
-    # Get universe and initialise relevant rows i nintent
-    from src.main import get_hyperliquid_trading_universe, get_ohlcv, get_final_pricing
-
-    db_path = 'data/pricing/ohlcv_data.duckdb'
-    top = get_latest_market_cap()
-    hl = get_hl_coins()
-    universe = get_hyperliquid_trading_universe(top, hl)
-    # Get pricing and add to intent
-    conn = duckdb.connect(db_path)
-    hyperliquid_prices = get_ohlcv(conn)
-
-    latest_view = pd.read_csv('data/snapshots/mids.csv')
-    prices, returns_adj = get_final_pricing(hyperliquid_prices,universe,latest_view)
-
-        ewmac_forecast = ewmac(returns_adj, ewmac_fast)
-        breakout_forecast = breakout(prices, breakout_window)
-        bollinger_forecast = scaled_bollinger(prices, param=bollinger_window, scalar=1)
-        mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast], axis=0)
-        vo = prices.pct_change().ewm(com=vo_window, min_periods=20).std().values
-        cor = returns_adj.ewm(com=correlation, min_periods=correlation).corr()
-
-
-        target_weights, portfolio = run_trading_logic(state)
-        portfolio.snapshot()
+top = get_latest_market_cap()
+hl = get_hl_coins()
+universe, symbol_index = get_hyperliquid_trading_universe(top, hl)
+# symbol_index = {universe[k]:k for k in range(len(universe))}
+# Get pricing and add to intent
+conn = duckdb.connect(db_path)
+hyperliquid_prices = get_ohlcv(conn)
+latest_view = pd.read_csv('data/snapshots/mids.csv', index_col=0)
+prices, returns_adj = get_final_pricing(hyperliquid_prices,universe,latest_view)
+config = StrategyConfig
+ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
+breakout_forecast = breakout(prices, config.breakout_window)
+bollinger_forecast = scaled_bollinger(prices, param=config.bollinger_window, scalar=1)
+mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast], axis=0)
+vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
+cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
+portfolio = run_backtest(prices, mu, vo, cor, config)
+portfolio.snapshot()
