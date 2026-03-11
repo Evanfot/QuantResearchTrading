@@ -1,9 +1,17 @@
 # %% %%
+from dataclasses import dataclass
+import sys
+from pathlib import Path
+
+root = Path().resolve()
+while not (root / "src").exists():
+    root = root.parent
 import os
+os.chdir(root)
+print("Working directory:", root)
 import json
 import logging
 import pandas as pd
-from pathlib import Path
 import importlib
 from eth_account import Account
 from hyperliquid.exchange import Exchange
@@ -20,9 +28,7 @@ import requests
 import duckdb
 from dotenv import load_dotenv
 from decimal import Decimal, getcontext
-from typing import List, Dict
-import json
-from pathlib import Path
+from typing import List, Dict, Optional, Any
 from src.state.strategy_state import load_state, save_state, get_state_positions
 from src.loggers.intent_logger import (
     init_intent,
@@ -138,7 +144,9 @@ def get_hyperliquid_trading_universe(top_market_cap, hl_universe):
     result = filtered[:50]
 
     universe = list(set([k['symbol'] for k in result]))
-    return universe
+
+    symbol_index = {universe[k]:k for k in range(len(universe))}
+    return universe, symbol_index
 
 
 def initialise_asset_intent(intent, universe):
@@ -147,7 +155,7 @@ def initialise_asset_intent(intent, universe):
     return intent
 
 
-# %% PRICING:
+# %% PRICES:
 def get_ohlcv(conn):
     df = conn.execute("""
         SELECT datetime, symbol, close, volume
@@ -156,12 +164,10 @@ def get_ohlcv(conn):
     conn.close()
     hyperliquid_prices = df.pivot(index="datetime", columns="symbol", values="close")
     return hyperliquid_prices
-    
 
 def update_ltps():
     run_update_mids()
     latest_view = pd.read_csv('data/snapshots/mids.csv')
-    # latest_view = run_update_mids()
     latest_view.set_index('symbol',inplace=True)
     ltps = latest_view.to_dict()['mid']
     ltps = {key:float(val) for key,val in ltps.items()}
@@ -172,7 +178,6 @@ def add_ltp_to_intent(intent, latest_view):
         intent["assets"][symbol]['market']['mark_price'] = float(latest_view.at[f"{symbol}",'mid'])
         intent["assets"][symbol]['market']['data_timestamp'] = latest_view.loc[f"{symbol}",'downloaded_at']
     return intent
-
 
 #TODO: Come up with an overwrite for coins which don't have data history
 # %%
@@ -228,71 +233,262 @@ def carry_signal( funding_daily, returns, funding_span=8, vol_span=32, norm_span
     return carry
 
 # %%
-ewmac_fast = 4
-breakout_window = 14
-bollinger_window = 14
-vo_window = 20
-correlation = 64
 shrinkage_value = 0.5
 threshold_trade = False
 ignore_small = False
 add_commision = False
 
-def run_trading_logic(state):
+#TODO: remove symbol_index as param from this function
+
+@dataclass
+class StrategyConfig:
+    """Centralizes all tunable parameters to avoid global variables and magic numbers."""
+    shrinkage_value: float = 0.5
+    ewmac_fast = 4
+    breakout_window = 14
+    bollinger_window = 14
+    vo_window = 20
+    correlation = 64
+    ignore_small: bool = False
+    threshold_trade: bool = False
+    add_commission: bool = False
+    position_multiplier: float = 10.0
+    weight_multiplier: float = 0.02
+    small_threshold: float = 10.0
+
+@dataclass
+class StrategyIntent:
+    """Holds the computed state for a specific period."""
+    risk_position: np.ndarray
+    target_position: np.ndarray
+    expected_vo: np.ndarray
+    mask: np.ndarray
+
+def compute_strategy(
+    mu: np.ndarray, 
+    vo: np.ndarray, 
+    cor_matrix: np.ndarray, 
+    mask: np.ndarray,
+    config: StrategyConfig,
+    yesterday_pos: Optional[np.ndarray] = None
+) -> StrategyIntent:
+
+    matrix = shrink2id(cor_matrix, lamb=config.shrinkage_value)[mask][:, mask]
+
+    expected_mu = np.nan_to_num(mu[mask])
+    expected_vo = np.nan_to_num(vo[mask])
+
+    risk_position = solve(matrix, expected_mu) / inv_a_norm(expected_mu, matrix)
+    target_pos = config.position_multiplier * risk_position / expected_vo
+
+    if config.ignore_small:
+        target_pos[np.abs(target_pos) < config.small_threshold] = 0
+
+    # Restored threshold logic: Only applies if we provide yesterday's position
+    if config.threshold_trade and yesterday_pos is not None:
+        below_threshold = np.abs(target_pos - yesterday_pos) < config.small_threshold
+        target_pos[below_threshold] = yesterday_pos[below_threshold]
+
+    return StrategyIntent(
+        risk_position=risk_position,
+        target_position=target_pos,
+        expected_vo=expected_vo,
+        mask=mask
+    )
+
+def run_backtest(prices, mu, vo, cor, config: StrategyConfig):
     builder = Builder(prices=prices, initial_aum=1e3)
+
     for n, (t, state) in enumerate(builder):
         mask = state.mask
-        matrix = shrink2id(cor.loc[t[-1]].values, lamb=shrinkage_value)[mask, :][
-            :, mask
-        ]
-        expected_mu = np.nan_to_num(mu[n][mask])
-        expected_vo = np.nan_to_num(vo[n][mask])
-        risk_position = solve(matrix, expected_mu) / inv_a_norm(expected_mu, matrix)
-        target_pos = 1e1 * risk_position / expected_vo
-        if ignore_small:
-            target_pos[np.abs(target_pos)<10] = 0
-        if threshold_trade and n > 0:
-            current_pos = builder.position* builder.current_prices
-            yesterday_pos = positions[n-1][mask]
-            below_threshold = np.abs(target_pos - yesterday_pos) < 10
-            target_pos[below_threshold] = yesterday_pos[below_threshold]
-        builder.cashposition = target_pos
-        if add_commision:
-            # DO commission calcs here
-            commission = 0
+        
+        # Determine yesterday's position for the threshold logic
+        if config.threshold_trade and n > 0:
+            yesterday_pos_full = builder.position * builder.current_prices
+            yesterday_pos = yesterday_pos_full[mask]
+        else:
+            yesterday_pos = None
+
+        strategy_intent = compute_strategy(
+            mu=mu[n],
+            vo=vo[n],
+            cor_matrix=cor.loc[t[-1]].values,
+            mask=mask,
+            config=config,
+            yesterday_pos=yesterday_pos
+        )
+
+        builder.cashposition = strategy_intent.target_position
+
+        # Restored commission logic
+        if config.add_commission:
+            # TODO: DO commission calcs here based on turnover
+            commission = 0 
         else:
             commission = 0
+            
         builder.aum = state.aum - commission
-    intent['universe']['tradable'] = list(prices.columns.values[mask])
-    if mask.sum() < prices.shape[1]:
-        non_tradable = prices.columns.values[~mask]
-    else:
-        non_tradable = []
-    intent['universe']['non_tradable'] = non_tradable
-    portfolio = builder.build()
 
-    # strat_rets = portfolio.aum.diff()/1000
-    # # Following line is based on inspection
-    # strat_rets = strat_rets[strat_rets.index > dt.datetime(2024,8,30)]
-    # strat_sharpe = strat_rets.mean()/strat_rets.std()*np.sqrt(365)
-    # Save weights DataFrame
-    # TODO: get weights_df from portfolio.units
+    return builder.build()
+
+def log_strategy_intent(
+    intent_log: Dict[str, Any], 
+    prices: pd.DataFrame, 
+    strategy_intent: StrategyIntent, 
+    config: StrategyConfig
+):
+    mask = strategy_intent.mask
+    tradable = list(prices.columns.values[mask])
+    non_tradable = list(prices.columns.values[~mask])
+
+    intent_log['universe']['tradable'] = tradable
+    intent_log['universe']['non_tradable'] = non_tradable
+
+    weights = config.weight_multiplier * strategy_intent.risk_position / strategy_intent.expected_vo
+
+    for i, symbol in enumerate(tradable):
+        intent_log['assets'][symbol]['model']['risk_position'] = float(
+            strategy_intent.risk_position[i]
+        )
+        intent_log['assets'][symbol]['model']['target_weight'] = float(
+            weights[i]
+        )
+
+def run_live(
+    prices, 
+    mu, 
+    vo, 
+    cor, 
+    positions,     # Current quantities held (Step 2 input)
+    ltps,          # Latest Tradable Prices
+    intent_log,    # The dictionary to be populated
+    config, 
+    latest_view,   # DataFrame with mid prices and timestamps
+    logger,
+    intent_logger
+):
+    # --- 1. CORE ALPHA LOGIC ---
+    t = prices.index[-1]
+    mask = ~prices.loc[t].isna().values
     
-    # TODO: check whether this works if we don't have builder.build, i.e. return builder. Then backtest runs .build and live trading extracts stuff from state
-    weights_df = pd.DataFrame(state._prices)
-    weights_df['weight'] = 0.02*risk_position/expected_vo
-    logger_weight = weights_df['weight'].reindex(state._prices.index).values
-    for symbol in state._prices.index:
-        intent['assets'][symbol]['model']['risk_position'] = float(risk_position[symbol_index[symbol]])
-        intent['assets'][symbol]['model']['target_weight'] = float(logger_weight[symbol_index[symbol]])
+    strategy_intent = compute_strategy(
+        mu=mu[-1], 
+        vo=vo[-1], 
+        cor_matrix=cor.loc[t].values, 
+        mask=mask, 
+        config=config
+    )
 
-    weights_df['weight'] = 0.02*risk_position/expected_vo
-    target_weights  = weights_df['weight'].to_dict()
-    return target_weights, portfolio
+    # --- 2. LOG BASE METRICS (Step 1) ---
+    log_strategy_intent(intent_log, prices, strategy_intent, config)
+
+    # --- 3. HANDLE UNIVERSE DRIFT (Holdings outside current tradable set) ---
+    # Convert alpha array to dict for easier merging
+    tradable_symbols = prices.columns[mask]
+    conversion_factor = config.weight_multiplier / config.position_multiplier
+
+    target_weights = {
+        symbol: (pos * conversion_factor) 
+        for symbol, pos in zip(tradable_symbols, strategy_intent.target_position)
+    }
+    
+    target_zeroes = {coin: 0 for coin in set(positions.keys()) - set(target_weights.keys())}
+    intent_log['universe']['holdings_outside_universe'] = list(target_zeroes.keys())
+    
+    # Initialize log structure for legacy/dropped assets
+    for symbol in target_zeroes.keys():
+        if symbol not in intent_log['assets']:
+            intent_log['assets'][symbol] = init_asset()
+        intent_log["assets"][symbol]['market']['mark_price'] = float(latest_view.loc[symbol, 'mid'])
+        intent_log["assets"][symbol]['market']['data_timestamp'] = latest_view.loc[symbol, 'downloaded_at']
+
+    # Merge weights: tradable alpha + assets we need to exit
+    all_target_weights = {**target_weights, **target_zeroes}
+
+    # --- 4. CONVERT WEIGHTS TO TARGET QUANTITIES ---
+    account_val = intent_log['portfolio']['equity_used_for_sizing']
+    
+    for symbol, weight in all_target_weights.items():
+        # Update current state in log
+        current_qty = positions.get(symbol, 0)
+        intent_log['assets'][symbol]['current']['qty'] = float(current_qty)
+        
+        # Calculate Target Qty
+        target_val = weight * account_val
+        target_qty = target_val / ltps[symbol]
+        intent_log['assets'][symbol]['target']['qty'] = float(target_qty)
+        
+    # --- 5. EXECUTION LOGIC (Step 2 & 3) ---
+    # This calls your existing function to handle small trade logic and rounding
+    target_qtys_dict = {s: intent_log['assets'][s]['target']['qty'] for s in all_target_weights.keys()}
+    
+    order_intentions = get_order_intention(
+        target_qtys=target_qtys_dict, 
+        positions_input=positions, 
+        logger=logger
+    )
+
+    # --- 6. FINAL LOGGING & DISPATCH ---
+    for coin, order in order_intentions.items():
+        intent_log['assets'][coin]['order_intent'].update({
+            'coin': order['coin'],
+            'side': order['side'],
+            'delta': order['delta'],
+            'target': order['target'],
+            'current': order['current']
+        })
+
+    intent_logger.log(intent_log)
+    return order_intentions 
+
+# def run_trading_logic(prices, mu, vo, cor, symbol_index):
+#     builder = Builder(prices=prices, initial_aum=1e3)
+#     for n, (t, state) in enumerate(builder):
+#         mask = state.mask
+#         matrix = shrink2id(cor.loc[t[-1]].values, lamb=shrinkage_value)[mask, :][
+#             :, mask
+#         ]
+#         expected_mu = np.nan_to_num(mu[n][mask])
+#         expected_vo = np.nan_to_num(vo[n][mask])
+#         risk_position = solve(matrix, expected_mu) / inv_a_norm(expected_mu, matrix)
+#         target_pos = 1e1 * risk_position / expected_vo
+#         if ignore_small:
+#             target_pos[np.abs(target_pos)<10] = 0
+#         if threshold_trade and n > 0:
+#             current_pos = builder.position* builder.current_prices
+#             yesterday_pos = positions[n-1][mask]
+#             below_threshold = np.abs(target_pos - yesterday_pos) < 10
+#             target_pos[below_threshold] = yesterday_pos[below_threshold]
+#         builder.cashposition = target_pos
+#         if add_commision:
+#             # DO commission calcs here
+#             commission = 0
+#         else:
+#             commission = 0
+#         builder.aum = state.aum - commission
+#     intent['universe']['tradable'] = list(prices.columns.values[mask])
+#     if mask.sum() < prices.shape[1]:
+#         non_tradable = prices.columns.values[~mask]
+#     else:
+#         non_tradable = []
+#     intent['universe']['non_tradable'] = non_tradable
+#     portfolio = builder.build()
+
+#     weights_df = pd.DataFrame(state._prices)
+#     weights_df['weight'] = 0.02*risk_position/expected_vo
+#     logger_weight = weights_df['weight'].reindex(state._prices.index).values
+#     for symbol in state._prices.index:
+#         intent['assets'][symbol]['model']['risk_position'] = float(risk_position[symbol_index[symbol]])
+#         intent['assets'][symbol]['model']['target_weight'] = float(logger_weight[symbol_index[symbol]])
+
+#     weights_df['weight'] = 0.02*risk_position/expected_vo
+#     target_weights  = weights_df['weight'].to_dict()
+#     return target_weights, portfolio
+
 
 
 # %%
-def get_order_intention(target_qtys: dict, sz_decimals: dict, logger: object, positions_input: dict = None) -> dict:
+def get_order_intention(target_qtys: dict, logger: object, positions_input: dict = None) -> dict:
     order_intentions = {}
 
     for coin, target_qty in target_qtys.items():
@@ -396,6 +592,8 @@ def generate_readable_summary(orders, ltps):
 
 # %%
 if __name__ == '__main__':
+    config = StrategyConfig(
+    )
     state = load_state(STATE_PATH)
     state['last_trading_run_id'] = run_id
     positions = get_state_positions(state)
@@ -409,7 +607,8 @@ if __name__ == '__main__':
     except:
         logger.warning(f"can't dl positions from exchange, local_state positions used")
         exchange_state = read_latest_exchange_state()
-    
+        #TODO use local positions here, when position_logger is more dependable
+ 
     # Get asset metadata
 # TODO: Add try except to download latest meta and read from file in case it doesn't work
     meta = read_latest_meta()
@@ -426,18 +625,17 @@ if __name__ == '__main__':
     # Get universe and initialise relevant rows i nintent
     top = get_latest_market_cap()
     hl = get_hl_coins()
-    universe = get_hyperliquid_trading_universe(top, hl)
+    universe, symbol_index = get_hyperliquid_trading_universe(top, hl)
+    # symbol_index = {universe[k]:k for k in range(len(universe))}
     # Get pricing and add to intent
     conn = duckdb.connect(db_path)
     hyperliquid_prices = get_ohlcv(conn)
     ltps = update_ltps()
     #TODO: Change below to use ltps instead of latest_view
-    latest_view = pd.read_csv('data/snapshots/mids.csv')
-    latest_view.set_index('symbol',inplace=True)
+    latest_view = pd.read_csv('data/snapshots/mids.csv', index_col=0)
     prices, returns_adj = get_final_pricing(hyperliquid_prices,universe,latest_view)
     if 1:
         intent["universe"]["tradable"] =universe
-        symbol_index = {universe[k]:k for k in range(len(universe))}
         intent = initialise_asset_intent(intent, universe)
         intent['portfolio']['equity_usd'] = float(exchange_state['marginSummary']['accountValue'])
         #TODO: If exchange_state isn't latest, apply haircut?
@@ -449,12 +647,12 @@ if __name__ == '__main__':
 
         intent = add_ltp_to_intent(intent, latest_view)
         # Calc signals, vols, corr and add to intent
-        ewmac_forecast = ewmac(returns_adj, ewmac_fast)
-        breakout_forecast = breakout(prices, breakout_window)
-        bollinger_forecast = scaled_bollinger(prices, param=bollinger_window, scalar=1)
+        ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
+        breakout_forecast = breakout(prices, config.breakout_window)
+        bollinger_forecast = scaled_bollinger(prices, param=config.bollinger_window, scalar=1)
         mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast], axis=0)
-        vo = prices.pct_change().ewm(com=vo_window, min_periods=20).std().values
-        cor = returns_adj.ewm(com=correlation, min_periods=correlation).corr()
+        vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
+        cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
         #TODO: change intent update to a separate function
         for symbol in universe:
             intent['assets'][symbol]['model']['vol_1d'] = float(vo[-1,symbol_index[symbol]])
@@ -465,42 +663,8 @@ if __name__ == '__main__':
         }
         intent['risk_inputs']['correlation_matrix'] = cor.loc[prices.index[-1]].to_dict()
         # Get target weights
-        target_weights, portfolio = run_trading_logic(state)
-        # If coin in positions not in target weights, set target weight to zero
-        target_zeroes = {coin: 0 for coin in set(positions.keys())-set(target_weights.keys())}
-        intent['universe']['holdings_outside_universe'] = list(target_zeroes.keys())
-        intent = initialise_asset_intent(intent, list(target_zeroes.keys()))
-        for key,value in positions.items():
-            intent['assets'][key]['current']['qty'] = value
-
-        for symbol in target_zeroes.keys():
-            intent["assets"][symbol] = init_asset()
-            intent["assets"][symbol]['market']['mark_price'] = float(latest_view.loc[f"{symbol}",'mid'])
-            intent["assets"][symbol]['market']['data_timestamp'] = latest_view.loc[f"{symbol}",'downloaded_at']
-
-        target_weights = target_weights|target_zeroes
-        #  ─── DETERMINE TARGET POSITIONS ──────────────────────────────────────
-        account_val = intent['portfolio']['equity_used_for_sizing']
-        target_values = {coin: weight*account_val for coin, weight in target_weights.items()}
-        target_qtys = {coin: target_values[coin] / ltps[coin] for coin in target_weights.keys()}
-
-        for key,value in target_qtys.items():
-            intent['assets'][key]['target']['qty'] = float(value)
-        order_intentions = get_order_intention(
-            target_qtys=target_qtys, 
-            positions_input=positions, 
-            sz_decimals=sz_decimals, 
-            logger=logger
-        )
-        for coin in order_intentions.keys():
-            order = order_intentions[coin]
-            intent['assets'][coin]['order_intent']['coin'] = order['coin']
-            intent['assets'][coin]['order_intent']['side'] = order['side']
-            intent['assets'][coin]['order_intent']['delta'] = order['delta']
-            intent['assets'][coin]['order_intent']['target'] = order['target']
-            intent['assets'][coin]['order_intent']['current'] = order['current']
-
-        intent_logger.log(intent)
+        order_intentions = run_live( prices, mu, vo, cor, positions, ltps, intent, config, 
+            latest_view, logger, intent_logger)
 
     intent_from_file = intent_logger.read_latest()
     asset_list = [asset for asset in intent_from_file['assets']]
@@ -514,9 +678,8 @@ if __name__ == '__main__':
     orders, cancels = get_execution_plan(order_intentions, open_orders, ltps, sz_decimals, logger)
     trading_summary = generate_readable_summary(orders, ltps)
     print(trading_summary)
-    # 
-    # 2. Cancel stale
     if not DRY_RUN:
+    # 2. Cancel stale
         if cancels:
             logger.info(f"Cancel Requests: {cancels}")
             resp = ex.bulk_cancel(cancels)
