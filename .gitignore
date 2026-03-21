@@ -243,3 +243,6 @@ Notes.md
 *.cache
 data/
 changelog.md
+__pycache__/
+*.pyc
+.DS_Store
