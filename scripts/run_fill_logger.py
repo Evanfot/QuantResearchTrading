@@ -14,20 +14,7 @@ from src.state.strategy_state import load_state, save_state
 
 from hyperliquid.info import Info
 from hyperliquid.utils.constants import MAINNET_API_URL
-POLL_INTERVAL_SECONDS = 1.0
 from src.positions.position_rebuilder import PositionRebuilder
-
-def get_hyperliquid_positions(user_state):
-    try:
-        if "assetPositions" in user_state and user_state["assetPositions"]:
-            positions = {
-                p['position']["coin"]: float(p["position"]["szi"])
-                for p in user_state["assetPositions"]}
-        elif len(user_state['assetPositions']) == 0:
-            positions = {}
-    except requests.RequestException as e:
-        print(f"Error fetching balances: {e}")
-    return positions
 
 def main():
     """Run one fill-logger poll cycle. Returns open_orders so the caller can loop."""
@@ -68,7 +55,7 @@ def main():
             last_ts = max_seen_ts + 1
             state["last_fill_timestamp_ms"] = last_ts
             state["schema_version"] = 1.2
-            state["positions_updated_at_ms"] = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+            state["fills_logged_at_ms"] = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
 
             rebuilder = PositionRebuilder(state_positions)
             fills = fill_logger.parse_fills(

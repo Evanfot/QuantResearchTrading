@@ -82,6 +82,14 @@ DATA_MINUTE_UTC = 1
 TRADING_EXEC_HOUR_UTC = 7  # 07:00 UTC
 TRADING_INTENT_HOUR_UTC = 12  # 12:00 UTC
 TRADING_INTENT_MINUTE_UTC = 1
+POSITION_CHECK_INTERVAL_HOURS = 1
+
+def is_position_check_due(now, state):
+    last_ms = state.get("last_position_check_ms")
+    if last_ms is None:
+        return True
+    last = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
+    return (now - last).total_seconds() >= POSITION_CHECK_INTERVAL_HOURS * 3600
 
 def is_data_due(now, state):
     if state.get("last_data_run_ms") is None:
@@ -133,6 +141,25 @@ def main():
             state["has_open_orders"] = bool(open_orders)
             save_state(state, STATE_PATH)
 
+        # ---- POSITION RECONCILIATION (once per hour) ----
+        if is_position_check_due(now, state):
+            try:
+                exchange_state = run_exchange_state()
+                exchange_positions = {
+                    row["position"]["coin"]: float(row["position"]["szi"])
+                    for row in exchange_state["assetPositions"]
+                }
+                state_positions = get_state_positions(state)
+                diff = dict_diff(exchange_positions, state_positions)
+                if diff["changed"]:
+                    logger.warning(
+                        f"Position mismatch — state vs exchange: {diff['changed']}"
+                    )
+            except:
+                logger.warning("Position check failed: could not reach exchange")
+            state["last_position_check_ms"] = int(now.timestamp() * 1000)
+            save_state(state, STATE_PATH)
+
         # ---- DATA TASK (daily at 12:01 UTC) ----
         if is_data_due(now, state):
             open_orders = run_fill_logger()
@@ -148,26 +175,12 @@ def main():
         if is_trading_intent_due(now, state):
             config = StrategyConfig()
             state = load_state(STATE_PATH)
-            #TODO: move positions check to happen periodically, not as part of intent
             positions = get_state_positions(state)
             try:
                 exchange_state = run_exchange_state()
-                exchange_state_positions = {
-                    row["position"]["coin"]: float(row["position"]["szi"])
-                    for row in exchange_state["assetPositions"]
-                }
-                diff = dict_diff(exchange_state_positions, positions)
-                if len(diff["changed"]) > 0:
-                    logger.warning(
-                        f"local_state positions don't match exchange positions"
-                    )
-                positions = exchange_state_positions
             except:
-                logger.warning(
-                    f"can't dl positions from exchange, local_state positions used"
-                )
+                logger.warning("can't fetch exchange state for intent, using latest cached")
                 exchange_state = read_latest_exchange_state()
-                # TODO use local positions here, when position_logger is more dependable
 
             # Get asset metadata
             # TODO: Add try except to download latest meta and read from file in case it doesn't work
