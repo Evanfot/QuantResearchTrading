@@ -1,6 +1,7 @@
 # %%
 import ccxt
 import asyncio
+import concurrent.futures
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 import datetime as dt
@@ -148,8 +149,9 @@ async def fetch_symbol(symbol: str):
     else:
         return f"[{symbol}] No new data"
 
-async def dl():
-    symbols = exchange.symbols
+async def dl(symbols=None):
+    if symbols is None:
+        symbols = exchange.symbols
     print(f"Fetching {len(symbols)} symbols...")
 
     semaphore = asyncio.Semaphore(5)
@@ -174,15 +176,18 @@ async def dl():
         print(r)
 
 
-def run_ohlcv_dl():
+def _run_async(coro):
+    """Run a coroutine from sync code, even when an event loop is already running (e.g. Jupyter)."""
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(asyncio.run, coro).result()
     except RuntimeError:
-        # No running loop → safe to use asyncio.run
-        return asyncio.run(dl())
-    else:
-        # Already running → schedule task
-        return loop.create_task(dl())
+        asyncio.run(coro)
+
+
+def run_ohlcv_dl(symbols=None):
+    _run_async(dl(symbols))
 
 if __name__ == "__main__":
     run_ohlcv_dl()

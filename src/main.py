@@ -46,6 +46,7 @@ from scripts.meta_data import read_latest_meta
 from scripts.meta_data import get_hl_coins
 from scripts.mkt_cap_data import get_latest_market_cap
 from src.ingestion.update_mids import run_update_mids
+from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily, update_latest_view
 
 # LOGGING CONFIG
 # --------------------------------------------
@@ -72,15 +73,13 @@ DRY_RUN = False  # %% set to False to enable live trading
 STATE_PATH = Path(f"state/hyperliquid_{WALLET_ADDRESS}_state.json")
 
 # %%
-# SETTINGS CONTINUED
+# SCHEDULING RULES
 # --------------------------------------------
 DATA_HOUR_UTC = 12
 DATA_MINUTE_UTC = 1
 TRADING_HOUR_UTC = 7  # 07:00 UTC
 TRADING_EXEC_HOUR_UTC = 12  # 12:00 UTC
 
-
-# %%
 def is_data_due(now, state):
     if state.get("last_data_run_ms") is None:
         return True
@@ -92,7 +91,6 @@ def is_data_due(now, state):
 
     return today > last and now.hour == DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
 
-
 def is_trading_intent_due(now, state):
     last_run_id = state.get("last_trading_intent_run_id")
     if last_run_id is None:
@@ -102,9 +100,7 @@ def is_trading_intent_due(now, state):
     last_run = dt.datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
     last = last_run.date()
     today = now.date()
-
     return today > last and now.hour == TRADING_HOUR_UTC
-
 
 def is_trading_exec_due(now, state):
     if state.get("last_trading_exec_run_id") is None:
@@ -119,25 +115,10 @@ def is_trading_exec_due(now, state):
 
     return today > last and now.hour >= TRADING_EXEC_HOUR_UTC
 
-
 def sleep_until_next_tick(state):
     sleep(1)
 
 
-import asyncio
-import concurrent.futures
-from src.ingestion.hyperliquid import dl as _dl_ohlcv, update_daily, update_latest_view
-
-
-def _run_async(coro):
-    """Run a coroutine from sync code, even when an event loop is already running (e.g. Jupyter)."""
-    try:
-        asyncio.get_running_loop()
-        # Already inside a running loop (Jupyter etc.) — run in a fresh thread
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            pool.submit(asyncio.run, coro).result()
-    except RuntimeError:
-        asyncio.run(coro)
 
 
 def main():
@@ -148,7 +129,7 @@ def main():
 
         # ---- DATA TASK (daily at 12:01 UTC) ----
         if is_data_due(now, state):
-            _run_async(_dl_ohlcv())
+            run_ohlcv_dl()
             update_daily()
             update_latest_view()
             state["last_data_run_ms"] = int(now.timestamp() * 1000)
@@ -334,9 +315,9 @@ def main():
         sleep_until_next_tick(state)
 
 
-# %% Universe
+# # %% Universe
 
-# Known stablecoin symbols
+# # Known stablecoin symbols
 stable = {"USDT", "USDC", "DAI", "USDD", "FDUSD", "TUSD", "DEI", "USDP", "GUSD", "USDE"}
 
 
@@ -807,155 +788,156 @@ def generate_readable_summary(orders, ltps):
         by="dv", ascending=False
     )
 
-
-# %%
 if __name__ == "__main__":
-    config = StrategyConfig()
-    state = load_state(STATE_PATH)
-    state["last_trading_run_id"] = run_id
-    positions = get_state_positions(state)
-    try:
-        exchange_state = run_exchange_state()
-        exchange_state_positions = {
-            row["position"]["coin"]: float(row["position"]["szi"])
-            for row in exchange_state["assetPositions"]
-        }
-        diff = dict_diff(exchange_state_positions, positions)
-        if len(diff["changed"]) > 0:
-            logger.warning(f"local_state positions don't match exchange positions")
-        positions = exchange_state_positions
-    except:
-        logger.warning(f"can't dl positions from exchange, local_state positions used")
-        exchange_state = read_latest_exchange_state()
-        # TODO use local positions here, when position_logger is more dependable
+    main()
+# # %%
+# if __name__ == "__main__":
+#     config = StrategyConfig()
+#     state = load_state(STATE_PATH)
+#     state["last_trading_run_id"] = run_id
+#     positions = get_state_positions(state)
+#     try:
+#         exchange_state = run_exchange_state()
+#         exchange_state_positions = {
+#             row["position"]["coin"]: float(row["position"]["szi"])
+#             for row in exchange_state["assetPositions"]
+#         }
+#         diff = dict_diff(exchange_state_positions, positions)
+#         if len(diff["changed"]) > 0:
+#             logger.warning(f"local_state positions don't match exchange positions")
+#         positions = exchange_state_positions
+#     except:
+#         logger.warning(f"can't dl positions from exchange, local_state positions used")
+#         exchange_state = read_latest_exchange_state()
+#         # TODO use local positions here, when position_logger is more dependable
 
-    # Get asset metadata
-    # TODO: Add try except to download latest meta and read from file in case it doesn't work
-    meta = read_latest_meta()
-    sz_decimals = {coin["name"]: coin["szDecimals"] for coin in meta["universe"]}
-    logger.info("Loaded size decimals for %d coins", len(sz_decimals))
-    #  ─── INIT ────────────────────────────────────────────────────────────────────
-    info = Info(MAINNET_API_URL, skip_ws=True)
-    wallet = Account.from_key(PRIVATE_KEY)
-    ex = Exchange(wallet=wallet, base_url=MAINNET_API_URL, account_address=API_ADDRESS)
+#     # Get asset metadata
+#     # TODO: Add try except to download latest meta and read from file in case it doesn't work
+#     meta = read_latest_meta()
+#     sz_decimals = {coin["name"]: coin["szDecimals"] for coin in meta["universe"]}
+#     logger.info("Loaded size decimals for %d coins", len(sz_decimals))
+#     #  ─── INIT ────────────────────────────────────────────────────────────────────
+#     info = Info(MAINNET_API_URL, skip_ws=True)
+#     wallet = Account.from_key(PRIVATE_KEY)
+#     ex = Exchange(wallet=wallet, base_url=MAINNET_API_URL, account_address=API_ADDRESS)
 
-    # Get universe and initialise relevant rows i nintent
-    top = get_latest_market_cap()
-    hl = get_hl_coins()
-    universe, symbol_index = get_hyperliquid_trading_universe(top, hl)
-    # symbol_index = {universe[k]:k for k in range(len(universe))}
-    # Get pricing and add to intent
-    conn = duckdb.connect(db_path)
-    hyperliquid_prices = get_ohlcv(conn)
-    ltps = update_ltps()
-    # TODO: Change below to use ltps instead of latest_view
-    latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
-    prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
-    if 1:
-        intent["universe"]["tradable"] = universe
-        intent = initialise_asset_intent(intent, universe)
-        intent["portfolio"]["equity_usd"] = float(
-            exchange_state["marginSummary"]["accountValue"]
-        )
-        # TODO: If exchange_state isn't latest, apply haircut?
-        # Add exchange state to intent
-        # TODO: add function to log all things from exchange_state
-        intent["portfolio"]["equity_used_for_sizing"] = float(
-            exchange_state["marginSummary"]["accountValue"]
-        )
-        intent["portfolio"]["maintenance_margin"] = exchange_state[
-            "crossMaintenanceMarginUsed"
-        ]
-        intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state[
-            "marginSummary"
-        ]["totalNtlPos"]
+#     # Get universe and initialise relevant rows i nintent
+#     top = get_latest_market_cap()
+#     hl = get_hl_coins()
+#     universe, symbol_index = get_hyperliquid_trading_universe(top, hl)
+#     # symbol_index = {universe[k]:k for k in range(len(universe))}
+#     # Get pricing and add to intent
+#     conn = duckdb.connect(db_path)
+#     hyperliquid_prices = get_ohlcv(conn)
+#     ltps = update_ltps()
+#     # TODO: Change below to use ltps instead of latest_view
+#     latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
+#     prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
+#     if 1:
+#         intent["universe"]["tradable"] = universe
+#         intent = initialise_asset_intent(intent, universe)
+#         intent["portfolio"]["equity_usd"] = float(
+#             exchange_state["marginSummary"]["accountValue"]
+#         )
+#         # TODO: If exchange_state isn't latest, apply haircut?
+#         # Add exchange state to intent
+#         # TODO: add function to log all things from exchange_state
+#         intent["portfolio"]["equity_used_for_sizing"] = float(
+#             exchange_state["marginSummary"]["accountValue"]
+#         )
+#         intent["portfolio"]["maintenance_margin"] = exchange_state[
+#             "crossMaintenanceMarginUsed"
+#         ]
+#         intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state[
+#             "marginSummary"
+#         ]["totalNtlPos"]
 
-        intent = add_ltp_to_intent(intent, latest_view)
-        # Calc signals, vols, corr and add to intent
-        ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
-        breakout_forecast = breakout(prices, config.breakout_window)
-        bollinger_forecast = scaled_bollinger(
-            prices, param=config.bollinger_window, scalar=1
-        )
-        mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast], axis=0)
-        vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
-        cor = returns_adj.ewm(
-            com=config.correlation, min_periods=config.correlation
-        ).corr()
-        # TODO: change intent update to a separate function
-        for symbol in universe:
-            intent["assets"][symbol]["model"]["vol_1d"] = float(
-                vo[-1, symbol_index[symbol]]
-            )
-            intent["assets"][symbol]["model"]["signal"] = {
-                "mu": float(mu[-1, symbol_index[symbol]]),
-                "sub_signals": {
-                    "ewmac": float(ewmac_forecast[-1, symbol_index[symbol]]),
-                    "breakout": float(breakout_forecast[-1, symbol_index[symbol]]),
-                    "bollinger": float(bollinger_forecast[-1, symbol_index[symbol]]),
-                },
-            }
-        intent["risk_inputs"]["correlation_matrix"] = cor.loc[
-            prices.index[-1]
-        ].to_dict()
-        # Get target weights
-        order_intentions = run_live(
-            prices,
-            mu,
-            vo,
-            cor,
-            positions,
-            ltps,
-            intent,
-            config,
-            latest_view,
-            logger,
-            intent_logger,
-        )
+#         intent = add_ltp_to_intent(intent, latest_view)
+#         # Calc signals, vols, corr and add to intent
+#         ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
+#         breakout_forecast = breakout(prices, config.breakout_window)
+#         bollinger_forecast = scaled_bollinger(
+#             prices, param=config.bollinger_window, scalar=1
+#         )
+#         mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast], axis=0)
+#         vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
+#         cor = returns_adj.ewm(
+#             com=config.correlation, min_periods=config.correlation
+#         ).corr()
+#         # TODO: change intent update to a separate function
+#         for symbol in universe:
+#             intent["assets"][symbol]["model"]["vol_1d"] = float(
+#                 vo[-1, symbol_index[symbol]]
+#             )
+#             intent["assets"][symbol]["model"]["signal"] = {
+#                 "mu": float(mu[-1, symbol_index[symbol]]),
+#                 "sub_signals": {
+#                     "ewmac": float(ewmac_forecast[-1, symbol_index[symbol]]),
+#                     "breakout": float(breakout_forecast[-1, symbol_index[symbol]]),
+#                     "bollinger": float(bollinger_forecast[-1, symbol_index[symbol]]),
+#                 },
+#             }
+#         intent["risk_inputs"]["correlation_matrix"] = cor.loc[
+#             prices.index[-1]
+#         ].to_dict()
+#         # Get target weights
+#         order_intentions = run_live(
+#             prices,
+#             mu,
+#             vo,
+#             cor,
+#             positions,
+#             ltps,
+#             intent,
+#             config,
+#             latest_view,
+#             logger,
+#             intent_logger,
+#         )
 
-    intent_from_file = intent_logger.read_latest()
-    asset_list = [asset for asset in intent_from_file["assets"]]
-    order_intentions = {}
-    for asset in asset_list:
-        order_intentions[asset] = intent_from_file["assets"][asset]["order_intent"]
-    # --- EXECUTION BLOCK ---
-    open_orders = info.open_orders(WALLET_ADDRESS)
-    ltps = update_ltps()
-    # 1. Generate the plan, trade towards order intentions as long as target > $10, order size > $10 etc.
-    orders, cancels = get_execution_plan(
-        order_intentions, open_orders, ltps, sz_decimals, logger
-    )
-    trading_summary = generate_readable_summary(orders, ltps)
-    print(trading_summary)
-    if not DRY_RUN:
-        # 2. Cancel stale
-        if cancels:
-            logger.info(f"Cancel Requests: {cancels}")
-            resp = ex.bulk_cancel(cancels)
-            logger.info(f"Cancel Response: {resp}")
+#     intent_from_file = intent_logger.read_latest()
+#     asset_list = [asset for asset in intent_from_file["assets"]]
+#     order_intentions = {}
+#     for asset in asset_list:
+#         order_intentions[asset] = intent_from_file["assets"][asset]["order_intent"]
+#     # --- EXECUTION BLOCK ---
+#     open_orders = info.open_orders(WALLET_ADDRESS)
+#     ltps = update_ltps()
+#     # 1. Generate the plan, trade towards order intentions as long as target > $10, order size > $10 etc.
+#     orders, cancels = get_execution_plan(
+#         order_intentions, open_orders, ltps, sz_decimals, logger
+#     )
+#     trading_summary = generate_readable_summary(orders, ltps)
+#     print(trading_summary)
+#     if not DRY_RUN:
+#         # 2. Cancel stale
+#         if cancels:
+#             logger.info(f"Cancel Requests: {cancels}")
+#             resp = ex.bulk_cancel(cancels)
+#             logger.info(f"Cancel Response: {resp}")
 
-        # 3. Place New Orders
-        exchange = "hyperliquid"
-        if orders:
-            response = ex.bulk_orders(orders)
+#         # 3. Place New Orders
+#         exchange = "hyperliquid"
+#         if orders:
+#             response = ex.bulk_orders(orders)
 
-            if response.get("status") == "ok":
-                all_statuses = response["response"]["data"]["statuses"]
-                for i, status in enumerate(all_statuses):
-                    mock_res = {"response": {"data": {"statuses": [status]}}}
-                    order_info = orders[i]
+#             if response.get("status") == "ok":
+#                 all_statuses = response["response"]["data"]["statuses"]
+#                 for i, status in enumerate(all_statuses):
+#                     mock_res = {"response": {"data": {"statuses": [status]}}}
+#                     order_info = orders[i]
 
-                    order_logger.log_order_submission(
-                        run_id=run_id,
-                        exchange=exchange,
-                        account=WALLET_ADDRESS,
-                        symbol=order_info["coin"],
-                        side="buy" if order_info["is_buy"] else "sell",
-                        order_type="LIMIT",
-                        price=order_info["limit_px"],
-                        qty=order_info["sz"],
-                        response=mock_res,
-                    )
-            else:
-                print(f"Bulk submission failed: {response}")
-        logging.info("Rebalancing complete.")
+#                     order_logger.log_order_submission(
+#                         run_id=run_id,
+#                         exchange=exchange,
+#                         account=WALLET_ADDRESS,
+#                         symbol=order_info["coin"],
+#                         side="buy" if order_info["is_buy"] else "sell",
+#                         order_type="LIMIT",
+#                         price=order_info["limit_px"],
+#                         qty=order_info["sz"],
+#                         response=mock_res,
+#                     )
+#             else:
+#                 print(f"Bulk submission failed: {response}")
+#         logging.info("Rebalancing complete.")
