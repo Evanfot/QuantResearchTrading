@@ -93,6 +93,19 @@ def is_data_due(now, state):
     return today > last and now.hour == DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
 
 
+def is_trading_intent_due(now, state):
+    last_run_id = state.get("last_trading_intent_run_id")
+    if last_run_id is None:
+        return True
+
+    ts_str = last_run_id.split("_")[0]  # e.g. "20240321T120000Z"
+    last_run = dt.datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+    last = last_run.date()
+    today = now.date()
+
+    return today > last and now.hour == TRADING_HOUR_UTC
+
+
 def is_trading_exec_due(now, state):
     if state.get("last_trading_exec_run_id") is None:
         return True
@@ -131,24 +144,21 @@ def main():
     state = load_state(STATE_PATH)
 
     while True:
-        now = dt.datetime.now(datetime.timezone.utc)
+        now = dt.datetime.now(dt.timezone.utc)
 
         # ---- DATA TASK (daily at 12:01 UTC) ----
         if is_data_due(now, state):
-            # run_data_ingestion(state)
             _run_async(_dl_ohlcv())
             update_daily()
             update_latest_view()
-            # TODO: Implement below
             state["last_data_run_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
 
-        # ---- TRADING TASK (once per day at 07:00 UTC) ----
-        if is_trading_due(now, state):
+        # ---- TRADING INTENT TASK (once per day at TRADING_HOUR_UTC) ----
+        if is_trading_intent_due(now, state):
             config = StrategyConfig()
             state = load_state(STATE_PATH)
-            state["last_trading_run_id"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-            save_state(state, STATE_PATH)
+            #TODO: move positions check to happen periodically, not as part of intent
             positions = get_state_positions(state)
             try:
                 exchange_state = run_exchange_state()
@@ -172,22 +182,11 @@ def main():
             # Get asset metadata
             # TODO: Add try except to download latest meta and read from file in case it doesn't work
             meta = read_latest_meta()
-            sz_decimals = {
-                coin["name"]: coin["szDecimals"] for coin in meta["universe"]
-            }
-            logger.info("Loaded size decimals for %d coins", len(sz_decimals))
-            #  ─── INIT ────────────────────────────────────────────────────────────────────
-            info = Info(MAINNET_API_URL, skip_ws=True)
-            wallet = Account.from_key(PRIVATE_KEY)
-            ex = Exchange(
-                wallet=wallet, base_url=MAINNET_API_URL, account_address=API_ADDRESS
-            )
 
-            # Get universe and initialise relevant rows i nintent
+            # Get universe and initialise relevant rows in intent
             top = get_latest_market_cap()
             hl = get_hl_coins()
             universe, symbol_index = get_hyperliquid_trading_universe(top, hl)
-            # symbol_index = {universe[k]:k for k in range(len(universe))}
             # Get pricing and add to intent
             conn = duckdb.connect(db_path)
             hyperliquid_prices = get_ohlcv(conn)
@@ -197,78 +196,91 @@ def main():
             prices, returns_adj = get_final_pricing(
                 hyperliquid_prices, universe, latest_view
             )
-            if 1:
-                intent["universe"]["tradable"] = universe
-                intent = initialise_asset_intent(intent, universe)
-                intent["portfolio"]["equity_usd"] = float(
-                    exchange_state["marginSummary"]["accountValue"]
-                )
-                # TODO: If exchange_state isn't latest, apply haircut?
-                # Add exchange state to intent
-                # TODO: add function to log all things from exchange_state
-                intent["portfolio"]["equity_used_for_sizing"] = float(
-                    exchange_state["marginSummary"]["accountValue"]
-                )
-                intent["portfolio"]["maintenance_margin"] = exchange_state[
-                    "crossMaintenanceMarginUsed"
-                ]
-                intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state[
-                    "marginSummary"
-                ]["totalNtlPos"]
+            intent["universe"]["tradable"] = universe
+            intent = initialise_asset_intent(intent, universe)
+            intent["portfolio"]["equity_usd"] = float(
+                exchange_state["marginSummary"]["accountValue"]
+            )
+            # TODO: If exchange_state isn't latest, apply haircut?
+            # Add exchange state to intent
+            # TODO: add function to log all things from exchange_state
+            # TODO: the equity used for sizing should be in execution block, not intent block
+            intent["portfolio"]["equity_used_for_sizing"] = float(
+                exchange_state["marginSummary"]["accountValue"]
+            )
+            intent["portfolio"]["maintenance_margin"] = exchange_state[
+                "crossMaintenanceMarginUsed"
+            ]
+            intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state[
+                "marginSummary"
+            ]["totalNtlPos"]
 
-                intent = add_ltp_to_intent(intent, latest_view)
-                # Calc signals, vols, corr and add to intent
-                ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
-                breakout_forecast = breakout(prices, config.breakout_window)
-                bollinger_forecast = scaled_bollinger(
-                    prices, param=config.bollinger_window, scalar=1
+            intent = add_ltp_to_intent(intent, latest_view)
+            # Calc signals, vols, corr and add to intent
+            ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
+            breakout_forecast = breakout(prices, config.breakout_window)
+            bollinger_forecast = scaled_bollinger(
+                prices, param=config.bollinger_window, scalar=1
+            )
+            mu = np.mean(
+                [bollinger_forecast, ewmac_forecast, breakout_forecast], axis=0
+            )
+            vo = (
+                prices.pct_change()
+                .ewm(com=config.vo_window, min_periods=20)
+                .std()
+                .values
+            )
+            cor = returns_adj.ewm(
+                com=config.correlation, min_periods=config.correlation
+            ).corr()
+            for symbol in universe:
+                intent["assets"][symbol]["model"]["vol_1d"] = float(
+                    vo[-1, symbol_index[symbol]]
                 )
-                mu = np.mean(
-                    [bollinger_forecast, ewmac_forecast, breakout_forecast], axis=0
-                )
-                vo = (
-                    prices.pct_change()
-                    .ewm(com=config.vo_window, min_periods=20)
-                    .std()
-                    .values
-                )
-                cor = returns_adj.ewm(
-                    com=config.correlation, min_periods=config.correlation
-                ).corr()
-                # TODO: change intent update to a separate function
-                for symbol in universe:
-                    intent["assets"][symbol]["model"]["vol_1d"] = float(
-                        vo[-1, symbol_index[symbol]]
-                    )
-                    intent["assets"][symbol]["model"]["signal"] = {
-                        "mu": float(mu[-1, symbol_index[symbol]]),
-                        "sub_signals": {
-                            "ewmac": float(ewmac_forecast[-1, symbol_index[symbol]]),
-                            "breakout": float(
-                                breakout_forecast[-1, symbol_index[symbol]]
-                            ),
-                            "bollinger": float(
-                                bollinger_forecast[-1, symbol_index[symbol]]
-                            ),
-                        },
-                    }
-                intent["risk_inputs"]["correlation_matrix"] = cor.loc[
-                    prices.index[-1]
-                ].to_dict()
-                # Get target weights
-                order_intentions = run_live(
-                    prices,
-                    mu,
-                    vo,
-                    cor,
-                    positions,
-                    ltps,
-                    intent,
-                    config,
-                    latest_view,
-                    logger,
-                    intent_logger,
-                )
+                intent["assets"][symbol]["model"]["signal"] = {
+                    "mu": float(mu[-1, symbol_index[symbol]]),
+                    "sub_signals": {
+                        "ewmac": float(ewmac_forecast[-1, symbol_index[symbol]]),
+                        "breakout": float(
+                            breakout_forecast[-1, symbol_index[symbol]]
+                        ),
+                        "bollinger": float(
+                            bollinger_forecast[-1, symbol_index[symbol]]
+                        ),
+                    },
+                }
+            intent["risk_inputs"]["correlation_matrix"] = cor.loc[
+                prices.index[-1]
+            ].to_dict()
+            # Get target weights
+            order_intentions = run_live(
+                prices,
+                mu,
+                vo,
+                cor,
+                positions,
+                ltps,
+                intent,
+                config,
+                latest_view,
+                logger,
+                intent_logger,
+            )
+            state["last_trading_intent_run_id"] = run_id
+            save_state(state, STATE_PATH)
+
+        # ---- EXECUTION TASK ----
+        if is_trading_exec_due(now, state):
+            meta = read_latest_meta()
+            sz_decimals = {
+                coin["name"]: coin["szDecimals"] for coin in meta["universe"]
+            }
+            info = Info(MAINNET_API_URL, skip_ws=True)
+            wallet = Account.from_key(PRIVATE_KEY)
+            ex = Exchange(
+                wallet=wallet, base_url=MAINNET_API_URL, account_address=API_ADDRESS
+            )
 
             intent_from_file = intent_logger.read_latest()
             asset_list = [asset for asset in intent_from_file["assets"]]

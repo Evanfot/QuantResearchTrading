@@ -175,8 +175,14 @@ async def dl():
 
 
 def run_ohlcv_dl():
-    asyncio.run(dl())
-
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop → safe to use asyncio.run
+        return asyncio.run(dl())
+    else:
+        # Already running → schedule task
+        return loop.create_task(dl())
 
 if __name__ == "__main__":
     run_ohlcv_dl()
