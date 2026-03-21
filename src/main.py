@@ -111,7 +111,20 @@ def sleep_until_next_tick(state):
     sleep(1)
 
 
-from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily, update_latest_view
+import asyncio
+import concurrent.futures
+from src.ingestion.hyperliquid import dl as _dl_ohlcv, update_daily, update_latest_view
+
+
+def _run_async(coro):
+    """Run a coroutine from sync code, even when an event loop is already running (e.g. Jupyter)."""
+    try:
+        asyncio.get_running_loop()
+        # Already inside a running loop (Jupyter etc.) — run in a fresh thread
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(asyncio.run, coro).result()
+    except RuntimeError:
+        asyncio.run(coro)
 
 
 def main():
@@ -123,7 +136,7 @@ def main():
         # ---- DATA TASK (daily at 12:01 UTC) ----
         if is_data_due(now, state):
             # run_data_ingestion(state)
-            run_ohlcv_dl()
+            _run_async(_dl_ohlcv())
             update_daily()
             update_latest_view()
             # TODO: Implement below
