@@ -47,6 +47,7 @@ def get_hyperliquid_positions(user_state):
     return positions
 
 def main():
+    """Run one fill-logger poll cycle. Returns open_orders so the caller can loop."""
     exchange = "hyperliquid"
 
     info = Info(MAINNET_API_URL, skip_ws=True)
@@ -58,65 +59,50 @@ def main():
     state_positions = state["positions"]
     assert state["exchange"] == 'hyperliquid'
     assert state["address"] == WALLET_ADDRESS
-    assert state["schema_version"] == 1
-    print(f"[fill_logger] starting at cursor={last_ts}, run_id={fill_run_id}")
-    open_orders = [1]
-    user_state = info.user_state(WALLET_ADDRESS)
-    while (len(open_orders) > 0):
-        try:
-            raw_fills = info.user_fills_by_time(WALLET_ADDRESS, last_ts)
+    assert state["schema_version"] == 1.2
+    print(f"[fill_logger] cursor={last_ts}, run_id={fill_run_id}")
 
-            fills_to_commit = []
-            max_seen_ts = last_ts
+    try:
+        raw_fills = info.user_fills_by_time(WALLET_ADDRESS, last_ts)
 
-            for fill in raw_fills:
-                ts = int(fill["time"])
+        fills_to_commit = []
+        max_seen_ts = last_ts
 
-                if ts > last_ts:
-                    fills_to_commit.append(fill)
-                    max_seen_ts = max(max_seen_ts, ts)
+        for fill in raw_fills:
+            ts = int(fill["time"])
+            if ts > last_ts:
+                fills_to_commit.append(fill)
+                max_seen_ts = max(max_seen_ts, ts)
 
-            if fills_to_commit:
-                fill_logger.log_fills(
-                    run_id=fill_run_id,
-                    exchange=exchange,
-                    account=WALLET_ADDRESS,
-                    fills=fills_to_commit,
-                    source="polling",
-                )
-#                 # advance cursor by 1 ms to avoid duplicates
-                last_ts = max_seen_ts + 1
+        if fills_to_commit:
+            fill_logger.log_fills(
+                run_id=fill_run_id,
+                exchange=exchange,
+                account=WALLET_ADDRESS,
+                fills=fills_to_commit,
+                source="polling",
+            )
+            last_ts = max_seen_ts + 1
+            state["last_fill_timestamp_ms"] = last_ts
+            state["schema_version"] = 1.2
+            state["positions_updated_at_ms"] = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
 
-                MAX_IDS = 20_000
-                # state["recent_seen_fill_ids"] = list(seen_ids)[-MAX_IDS:]
-                state["last_fill_timestamp_ms"] = last_ts
-                # state["exchange"] = 'hyperliquid'
-                # state["address"] = WALLET_ADDRESS
-                state["schema_version"] = 1
-                state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            rebuilder = PositionRebuilder(state_positions)
+            fills = fill_logger.parse_fills(
+                run_id=fill_run_id,
+                exchange=exchange,
+                account=WALLET_ADDRESS,
+                fills=fills_to_commit,
+                source="polling",
+            )
+            fills.sort(key=lambda x: x["fill_timestamp_ms"])
+            positions = rebuilder.rebuild_from_fills(fills)
+            state["positions"] = positions
+            save_state(state)
+    except Exception as e:
+        print(f"[fill_logger] error: {e}")
 
-                rebuilder = PositionRebuilder(state_positions)
-
-                fills = fill_logger.parse_fills(
-                    run_id=fill_run_id,
-                    exchange=exchange,
-                    account=WALLET_ADDRESS,
-                    fills=fills_to_commit,
-                    source="polling",
-                )
-                
-                # --- Sort fills chronologically ---
-                fills.sort(key=lambda x: x["fill_timestamp_ms"])
-                positions= rebuilder.rebuild_from_fills(fills)
-                state["positions"] = positions
-                save_state(state)
-        except Exception as e:
-#             # never crash the poller
-            print(f"[fill_logger] error: {e}")
-
-        positions = get_hyperliquid_positions(user_state)
-        open_orders = info.open_orders(WALLET_ADDRESS)
-        time.sleep(POLL_INTERVAL_SECONDS)
+    return info.open_orders(WALLET_ADDRESS)
 
 
 if 0:

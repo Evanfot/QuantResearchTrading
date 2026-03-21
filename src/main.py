@@ -47,6 +47,7 @@ from scripts.meta_data import get_hl_coins
 from scripts.mkt_cap_data import get_latest_market_cap
 from src.ingestion.update_mids import run_update_mids
 from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily, update_latest_view
+from scripts.run_fill_logger import main as run_fill_logger
 
 # LOGGING CONFIG
 # --------------------------------------------
@@ -77,8 +78,9 @@ STATE_PATH = Path(f"state/hyperliquid_{WALLET_ADDRESS}_state.json")
 # --------------------------------------------
 DATA_HOUR_UTC = 12
 DATA_MINUTE_UTC = 1
-TRADING_HOUR_UTC = 7  # 07:00 UTC
-TRADING_EXEC_HOUR_UTC = 12  # 12:00 UTC
+TRADING_EXEC_HOUR_UTC = 7  # 07:00 UTC
+TRADING_INTENT_HOUR_UTC = 12  # 12:00 UTC
+TRADING_INTENT_MINUTE_UTC = 1
 
 def is_data_due(now, state):
     if state.get("last_data_run_ms") is None:
@@ -100,7 +102,7 @@ def is_trading_intent_due(now, state):
     last_run = dt.datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
     last = last_run.date()
     today = now.date()
-    return today > last and now.hour == TRADING_HOUR_UTC
+    return today > last and now.hour == TRADING_INTENT_HOUR_UTC and now.minute >= TRADING_INTENT_MINUTE_UTC
 
 def is_trading_exec_due(now, state):
     if state.get("last_trading_exec_run_id") is None:
@@ -118,17 +120,23 @@ def is_trading_exec_due(now, state):
 def sleep_until_next_tick(state):
     sleep(1)
 
-
-
-
 def main():
     state = load_state(STATE_PATH)
 
     while True:
         now = dt.datetime.now(dt.timezone.utc)
 
+        # ---- FILL LOGGER (runs each tick while open orders remain) ----
+        if state.get("has_open_orders", False):
+            open_orders = run_fill_logger()
+            state["has_open_orders"] = bool(open_orders)
+            save_state(state, STATE_PATH)
+
         # ---- DATA TASK (daily at 12:01 UTC) ----
         if is_data_due(now, state):
+            open_orders = run_fill_logger()
+            state["has_open_orders"] = bool(open_orders)
+            save_state(state, STATE_PATH)
             run_ohlcv_dl()
             update_daily()
             update_latest_view()
@@ -271,20 +279,31 @@ def main():
                     "order_intent"
                 ]
             # --- EXECUTION BLOCK ---
-            open_orders = info.open_orders(WALLET_ADDRESS)
             ltps = update_ltps()
-            # 1. Generate the plan, trade towards order intentions as long as target > $10, order size > $10 etc.
-            orders, cancels = get_execution_plan(
-                order_intentions, open_orders, ltps, sz_decimals, logger
+            try:
+                exchange_state = run_exchange_state()
+                positions = {
+                    row["position"]["coin"]: float(row["position"]["szi"])
+                    for row in exchange_state["assetPositions"]
+                }
+            except:
+                logger.warning("can't fetch live positions for execution plan, falling back to state file")
+                positions = get_state_positions(state)
+            # 1. Cancel all open orders before generating new plan
+            if not DRY_RUN:
+                open_orders = info.open_orders(WALLET_ADDRESS)
+                if open_orders:
+                    cancels = [{"coin": o["coin"], "oid": o["oid"]} for o in open_orders]
+                    logger.info(f"Cancel Requests: {cancels}")
+                    resp = ex.bulk_cancel(cancels)
+                    logger.info(f"Cancel Response: {resp}")
+            # 2. Generate the plan
+            orders = get_execution_plan(
+                order_intentions, ltps, sz_decimals, logger, positions=positions
             )
             trading_summary = generate_readable_summary(orders, ltps)
             print(trading_summary)
             if not DRY_RUN:
-                # 2. Cancel stale
-                if cancels:
-                    logger.info(f"Cancel Requests: {cancels}")
-                    resp = ex.bulk_cancel(cancels)
-                    logger.info(f"Cancel Response: {resp}")
 
                 # 3. Place New Orders
                 exchange = "hyperliquid"
@@ -703,22 +722,21 @@ def get_order_intention(
 # %%
 def get_execution_plan(
     order_intentions: dict,
-    open_orders: list,
     ltps: dict,
     sz_decimals: dict,
     logger: object,
+    positions: dict = None,
     slippage_bps: int = 1,  # 1 basis point = 0.01%
-) -> tuple[list, list]:
+) -> list:
 
     exchange_orders = []
-    cancel_requests = []
     MAX_PRECISION = 6
 
     for coin, intention in order_intentions.items():
-        delta = intention["delta"]
         target_qty = intention["target"]
-        current_qty = intention["current"]
-        side = intention["side"]
+        current_qty = positions.get(coin, 0) if positions is not None else intention["current"]
+        delta = target_qty - current_qty
+        side = "BUY" if delta > 0 else "SELL"
 
         ltp = ltps.get(coin, 0)
         if ltp == 0:
@@ -771,11 +789,7 @@ def get_execution_plan(
             }
         )
 
-        # 4. Identify Stale Orders
-        open_order = next((o for o in open_orders if o["coin"] == coin), None)
-        if open_order:
-            cancel_requests.append({"coin": coin, "oid": open_order["oid"]})
-    return exchange_orders, cancel_requests
+    return exchange_orders
 
 
 def generate_readable_summary(orders, ltps):

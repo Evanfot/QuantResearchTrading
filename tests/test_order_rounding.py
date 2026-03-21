@@ -35,8 +35,8 @@ def test_price_rounding(run_context, coin, ltp, sz_dec, expected_price):
             "side": "BUY",
         }
     }
-    orders, _ = get_execution_plan(
-        order_intentions, [], {coin: ltp}, {coin: sz_dec},
+    orders = get_execution_plan(
+        order_intentions, {coin: ltp}, {coin: sz_dec},
         run_context["logger"], slippage_bps=0
     )
     assert len(orders) == 1, "Expected one order to be generated"
@@ -57,18 +57,20 @@ def test_price_rounding(run_context, coin, ltp, sz_dec, expected_price):
 def test_slippage(run_context, side, ltp, slippage_bps, expected_price):
     coin = "ETH"
     sz_dec = 3  # precision = max(0, 6-3) = 3
-    delta = 1.0 if side == "BUY" else -1.0
+    # Drive side via target/current so get_execution_plan derives it correctly
+    if side == "BUY":
+        target, current = 6.0, 5.0   # delta = +1.0
+    else:
+        target, current = 5.0, 6.0   # delta = -1.0
     order_intentions = {
         coin: {
             "coin": coin,
-            "delta": delta,
-            "target": 10.0,   # above $10 floor
-            "current": 0,
-            "side": side,
+            "target": target,
+            "current": current,
         }
     }
-    orders, _ = get_execution_plan(
-        order_intentions, [], {coin: ltp}, {coin: sz_dec},
+    orders = get_execution_plan(
+        order_intentions, {coin: ltp}, {coin: sz_dec},
         run_context["logger"], slippage_bps=slippage_bps
     )
     assert len(orders) == 1, "Expected one order to be generated"
