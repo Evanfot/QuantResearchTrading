@@ -122,19 +122,35 @@ def sleep_until_next_tick(state):
 
 def main():
     state = load_state(STATE_PATH)
+    first_run = True
 
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         run_id = generate_run_id()
+
+        if first_run:
+            logger.setLevel(logging.INFO)
+            logger.info(f"[startup] loop started at {now.isoformat()}")
+            logger.info(f"[startup] state loaded: last_data_run_ms={state.get('last_data_run_ms')}, "
+                        f"last_trading_intent_run_id={state.get('last_trading_intent_run_id')}, "
+                        f"last_trading_exec_ms={state.get('last_trading_exec_ms')}, "
+                        f"has_open_orders={state.get('has_open_orders')}, "
+                        f"fills_logged_at_ms={state.get('fills_logged_at_ms')}")
+
         # ---- FILL LOGGER (runs each tick while open orders remain) ----
         if state.get("has_open_orders", False):
+            logger.info("[fill_logger] open orders detected, polling fills")
             open_orders = run_fill_logger()
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
+            logger.info(f"[fill_logger] done, open_orders remaining: {len(open_orders)}")
+        elif first_run:
+            logger.info("[fill_logger] no open orders, skipping tick poll")
 
         # ---- POSITION RECONCILIATION + FILL LOGGER (once per hour) ----
         if is_position_check_due(now, state):
+            logger.info("[position_check] running hourly fill log + position reconciliation")
             open_orders = run_fill_logger()
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
@@ -150,13 +166,20 @@ def main():
                     logger.warning(
                         f"Position mismatch — state vs exchange: {diff['changed']}"
                     )
+                else:
+                    logger.info(f"[position_check] {len(state_positions)} positions match exchange")
             except:
                 logger.warning("Position check failed: could not reach exchange")
             state["last_position_check_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
+        elif first_run:
+            last_ms = state.get("last_position_check_ms", 0)
+            next_due = dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc) + dt.timedelta(hours=POSITION_CHECK_INTERVAL_HOURS)
+            logger.info(f"[position_check] not due, next at {next_due.isoformat()}")
 
-        # ---- DATA TASK (daily at 12:01 UTC) ----
+        # ---- DATA TASK (daily at 00:01 UTC) ----
         if is_data_due(now, state):
+            logger.info("[data] downloading OHLCV data")
             open_orders = run_fill_logger()
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
@@ -166,9 +189,14 @@ def main():
             update_latest_view()
             state["last_data_run_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
+            logger.info("[data] complete")
+        elif first_run:
+            last_ms = state.get("last_data_run_ms", 0)
+            logger.info(f"[data] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {DATA_HOUR_UTC:02d}:{DATA_MINUTE_UTC:02d} UTC)")
 
         # ---- TRADING INTENT TASK (once per day at TRADING_HOUR_UTC) ----
         if is_trading_intent_due(now, state):
+            logger.info("[intent] computing trading intent")
             intent = init_intent(mode="live", strategy_name="trend_v1", run_id=run_id)
             config = StrategyConfig()
             state = load_state(STATE_PATH)
@@ -269,9 +297,14 @@ def main():
             )
             state["last_trading_intent_run_id"] = run_id
             save_state(state, STATE_PATH)
+            logger.info(f"[intent] complete, run_id={run_id}, universe size={len(universe)}")
+        elif first_run:
+            last_id = state.get("last_trading_intent_run_id", "never")
+            logger.info(f"[intent] not due (last: {last_id}, scheduled: {TRADING_INTENT_HOUR_UTC:02d}:{TRADING_INTENT_MINUTE_UTC:02d} UTC)")
 
         # ---- EXECUTION TASK ----
         if is_trading_exec_due(now, state):
+            logger.info("[exec] running execution plan")
             meta = read_latest_meta()
             sz_decimals = {
                 coin["name"]: coin["szDecimals"] for coin in meta["universe"]
@@ -346,6 +379,16 @@ def main():
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
+            logger.info(f"[exec] complete, orders placed: {len(orders) if orders else 0}")
+        elif first_run:
+            last_ms = state.get("last_trading_exec_ms", 0)
+            next_due = dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc) + dt.timedelta(minutes=TRADING_EXEC_INTERVAL_MINUTES)
+            logger.info(f"[exec] not due (last: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, next: {next_due.isoformat()}, gate: after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC)")
+
+        if first_run:
+            logger.info("[startup] first iteration complete, switching to ERROR-only logging")
+            logger.setLevel(logging.ERROR)
+            first_run = False
 
         sleep_until_next_tick(state)
 
