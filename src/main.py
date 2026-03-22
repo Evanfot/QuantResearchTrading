@@ -1,7 +1,6 @@
 # %% %%
 import sys
 from pathlib import Path
-
 root = Path().resolve()
 while not (root / "src").exists():
     root = root.parent
@@ -9,6 +8,7 @@ import os
 
 os.chdir(root)
 print("Working directory:", root)
+import time
 import json
 import logging
 import pandas as pd
@@ -54,8 +54,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-run_id = generate_run_id()
-intent = init_intent(mode="live", strategy_name="trend_v1", run_id=run_id)
 intent_logger = IntentLogger("logs/intent.jsonl")
 order_logger = OrderLogger("logs/orders.jsonl")
 # --------------------------------------------
@@ -73,10 +71,11 @@ STATE_PATH = Path(f"state/hyperliquid_{WALLET_ADDRESS}_state.json")
 # %%
 # SCHEDULING RULES
 # --------------------------------------------
-DATA_HOUR_UTC = 12
+DATA_HOUR_UTC = 0
 DATA_MINUTE_UTC = 1
 TRADING_EXEC_HOUR_UTC = 7  # 07:00 UTC
-TRADING_INTENT_HOUR_UTC = 12  # 12:00 UTC
+TRADING_EXEC_INTERVAL_MINUTES = 30
+TRADING_INTENT_HOUR_UTC = 0  # 00:00 UTC
 TRADING_INTENT_MINUTE_UTC = 1
 POSITION_CHECK_INTERVAL_HOURS = 1
 
@@ -96,7 +95,7 @@ def is_data_due(now, state):
     last = last_run.date()
     today = now.date()
 
-    return today > last and now.hour == DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
+    return today > last and now.hour >= DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
 
 def is_trading_intent_due(now, state):
     last_run_id = state.get("last_trading_intent_run_id")
@@ -107,38 +106,38 @@ def is_trading_intent_due(now, state):
     last_run = dt.datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
     last = last_run.date()
     today = now.date()
-    return today > last and now.hour == TRADING_INTENT_HOUR_UTC and now.minute >= TRADING_INTENT_MINUTE_UTC
+    return today > last and now.hour >= TRADING_INTENT_HOUR_UTC and now.minute >= TRADING_INTENT_MINUTE_UTC
 
 def is_trading_exec_due(now, state):
-    if state.get("last_trading_exec_run_id") is None:
+    if now.hour < TRADING_EXEC_HOUR_UTC:
+        return False
+    last_ms = state.get("last_trading_exec_ms")
+    if not last_ms:
         return True
-
-    last_run_str = state.get("last_trading_exec_run_id")
-    if last_run_str is None:
-        return True
-    last_run = dt.datetime.fromisoformat(last_run_str.replace("Z", "+00:00"))
-    last = last_run.date()
-    today = now.date()
-
-    return today > last and now.hour >= TRADING_EXEC_HOUR_UTC
+    last = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
+    return (now - last).total_seconds() >= TRADING_EXEC_INTERVAL_MINUTES * 60
 
 def sleep_until_next_tick(state):
-    sleep(1)
+    time.sleep(1)
 
 def main():
     state = load_state(STATE_PATH)
 
     while True:
         now = dt.datetime.now(dt.timezone.utc)
-
+        run_id = generate_run_id()
         # ---- FILL LOGGER (runs each tick while open orders remain) ----
         if state.get("has_open_orders", False):
             open_orders = run_fill_logger()
             state["has_open_orders"] = bool(open_orders)
+            state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
 
-        # ---- POSITION RECONCILIATION (once per hour) ----
+        # ---- POSITION RECONCILIATION + FILL LOGGER (once per hour) ----
         if is_position_check_due(now, state):
+            open_orders = run_fill_logger()
+            state["has_open_orders"] = bool(open_orders)
+            state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             try:
                 exchange_state = run_exchange_state()
                 exchange_positions = {
@@ -160,6 +159,7 @@ def main():
         if is_data_due(now, state):
             open_orders = run_fill_logger()
             state["has_open_orders"] = bool(open_orders)
+            state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
             run_ohlcv_dl()
             update_daily()
@@ -169,6 +169,7 @@ def main():
 
         # ---- TRADING INTENT TASK (once per day at TRADING_HOUR_UTC) ----
         if is_trading_intent_due(now, state):
+            intent = init_intent(mode="live", strategy_name="trend_v1", run_id=run_id)
             config = StrategyConfig()
             state = load_state(STATE_PATH)
             positions = get_state_positions(state)
@@ -337,9 +338,14 @@ def main():
                                 qty=order_info["sz"],
                                 response=mock_res,
                             )
+                        logging.info("Rebalancing complete.")
                     else:
                         print(f"Bulk submission failed: {response}")
-                logging.info("Rebalancing complete.")
+            open_orders = run_fill_logger()
+            state["has_open_orders"] = bool(open_orders)
+            state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
+            state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
+            save_state(state, STATE_PATH)
 
         sleep_until_next_tick(state)
 
