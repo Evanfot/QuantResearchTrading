@@ -311,13 +311,13 @@ def main():
             orders = get_execution_plan(
                 order_intentions, ltps, sz_decimals, logger, positions=positions
             )
-            trading_summary = generate_readable_summary(orders, ltps)
-            print(trading_summary)
             if not DRY_RUN:
 
                 # 3. Place New Orders
                 exchange = "hyperliquid"
                 if orders:
+                    trading_summary = generate_readable_summary(orders, ltps)
+                    print(trading_summary)
                     response = ex.bulk_orders(orders)
 
                     if response.get("status") == "ok":
