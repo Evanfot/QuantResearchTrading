@@ -41,12 +41,8 @@ class PositionRebuilder:
         fill_qty = float(fill["qty"])        # signed
         fill_price = float(fill["price"])
         sz_decimals_coin = sz_decimals.get(coin, 0)
-        if coin in self.positions.keys():
-            pass
-        else:
-            self.positions[coin]['qty']=0
-            self.positions[coin]['avg_price']=0
-            self.positions[coin]['realized_pnl']=0
+        if coin not in self.positions:
+            self.positions[coin] = self._empty_position()
         # --- Case 1: No existing position ---
         pos = self.positions[coin]
         pos_qty = pos["qty"]

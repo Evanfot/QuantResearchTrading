@@ -243,6 +243,17 @@ Notes.md
 *.cache
 data/
 changelog.md
-__pycache__/
-*.pyc
+
+# macOS
 .DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Optional: pytest cache
+.pytest_cache/
+
+# Optional: virtual env
+.venv/
+venv/

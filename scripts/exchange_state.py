@@ -1,5 +1,4 @@
 # TODO: Abstract this as it's the same flow as meta_data
-# fetch_and_store_exchange_state.py
 import json
 import requests
 from datetime import datetime,timezone
