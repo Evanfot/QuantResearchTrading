@@ -21,14 +21,16 @@ TABLE_NAME = f"hyperliquid_{TIMEFRAME}"
 LIMIT = 500
 
 # === INITIALIZATION ===
-exchange = ccxt.hyperliquid({'enableRateLimit': True})
-exchange.load_markets()
+exchange = None
+con = None
 
-# === DUCKDB CONNECTION ===
-con = duckdb.connect(DB_PATH)
+def _init():
+    global exchange, con
+    exchange = ccxt.hyperliquid({'enableRateLimit': True})
+    exchange.load_markets()
 
-# Create table if it doesn't exist
-con.execute(f"""
+    con = duckdb.connect(DB_PATH)
+    con.execute(f"""
 CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
     symbol TEXT,
     datetime TIMESTAMP,
@@ -187,9 +189,11 @@ def _run_async(coro):
 
 
 def run_ohlcv_dl(symbols=None):
+    _init()
     _run_async(dl(symbols))
 
 if __name__ == "__main__":
     run_ohlcv_dl()
     update_daily()
     update_latest_view()
+# %%
