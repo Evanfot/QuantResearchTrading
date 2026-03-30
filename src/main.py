@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 from decimal import Decimal, getcontext
 from typing import List, Dict, Any
 from src.state.strategy_state import load_state, save_state, get_state_positions
-from src.signal import ewmac, breakout, scaled_bollinger, carry_signal
+from src.signal import ewmac, breakout, scaled_bollinger, carry_signal, alpha014, alpha020
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy, run_backtest
 from src.loggers.intent_logger import (
     init_intent,
@@ -45,6 +45,23 @@ from scripts.mkt_cap_data import get_latest_market_cap
 from src.ingestion.update_mids import run_update_mids
 from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily, update_latest_view
 from scripts.run_fill_logger import main as run_fill_logger
+
+def load_ohlcv_for_alphas(universe):
+    """Load daily open/high/low/close/volume for the universe from DuckDB."""
+    symbols_sql = ", ".join(f"'{s}/USDC:USDC'" for s in universe)
+    conn = duckdb.connect(db_path)
+    df = conn.execute(f"""
+        SELECT datetime AS date, symbol, open, high, low, close, volume
+        FROM hyperliquid_1d
+        WHERE symbol IN ({symbols_sql})
+        ORDER BY datetime
+    """).df()
+    conn.close()
+    df["symbol"] = df["symbol"].str.replace("/USDC:USDC", "", regex=False)
+    def pivot(col):
+        return df.pivot(index="date", columns="symbol", values=col)
+    o, h, l, c, v = (pivot(x) for x in ("open", "high", "low", "close", "volume"))
+    return o, h, l, c, v
 
 # LOGGING CONFIG
 # --------------------------------------------
@@ -73,7 +90,7 @@ STATE_PATH = Path(f"state/hyperliquid_{WALLET_ADDRESS}_state.json")
 # --------------------------------------------
 DATA_HOUR_UTC = 0
 DATA_MINUTE_UTC = 1
-TRADING_EXEC_HOUR_UTC = 7  # 07:00 UTC
+TRADING_EXEC_HOUR_UTC = 2  # 07:00 UTC
 TRADING_EXEC_INTERVAL_MINUTES = 30
 TRADING_INTENT_HOUR_UTC = 0  # 00:00 UTC
 TRADING_INTENT_MINUTE_UTC = 1
@@ -197,7 +214,7 @@ def main():
         # ---- TRADING INTENT TASK (once per day at TRADING_HOUR_UTC) ----
         if is_trading_intent_due(now, state):
             logger.info("[intent] computing trading intent")
-            intent = init_intent(mode="live", strategy_name="trend_v1", run_id=run_id)
+            intent = init_intent(mode="live", strategy_name="trend_v1.1", run_id=run_id)
             config = StrategyConfig()
             state = load_state(STATE_PATH)
             positions = get_state_positions(state)
@@ -250,8 +267,23 @@ def main():
             bollinger_forecast = scaled_bollinger(
                 prices, param=config.bollinger_window, scalar=1
             )
+
+            # Alpha014: -rank(ts_delta(returns, 3)) * ts_corr(open, volume, 10)
+            # Alpha020: -rank(open-lag(high,1)) * rank(open-lag(close,1)) * rank(open-lag(low,1))
+            o, h, l, c_alpha, v = load_ohlcv_for_alphas(universe)
+            o  =  o.reindex(index=prices.index, columns=prices.columns)
+            h  =  h.reindex(index=prices.index, columns=prices.columns)
+            l  =  l.reindex(index=prices.index, columns=prices.columns)
+            v  =  v.reindex(index=prices.index, columns=prices.columns)
+            c_alpha = c_alpha.reindex(index=prices.index, columns=prices.columns)
+            r_alpha = np.log(c_alpha).diff()
+
+            alpha014_forecast = alpha014(o, v, r_alpha)
+            alpha020_forecast = alpha020(o, h, l, c_alpha)
+
             mu = np.mean(
-                [bollinger_forecast, ewmac_forecast, breakout_forecast], axis=0
+                [bollinger_forecast, ewmac_forecast, breakout_forecast,
+                 alpha014_forecast, alpha020_forecast], axis=0
             )
             vo = (
                 prices.pct_change()
@@ -270,12 +302,10 @@ def main():
                     "mu": float(mu[-1, symbol_index[symbol]]),
                     "sub_signals": {
                         "ewmac": float(ewmac_forecast[-1, symbol_index[symbol]]),
-                        "breakout": float(
-                            breakout_forecast[-1, symbol_index[symbol]]
-                        ),
-                        "bollinger": float(
-                            bollinger_forecast[-1, symbol_index[symbol]]
-                        ),
+                        "breakout": float(breakout_forecast[-1, symbol_index[symbol]]),
+                        "bollinger": float(bollinger_forecast[-1, symbol_index[symbol]]),
+                        "alpha014": float(alpha014_forecast[-1, symbol_index[symbol]]),
+                        "alpha020": float(alpha020_forecast[-1, symbol_index[symbol]]),
                     },
                 }
             intent["risk_inputs"]["correlation_matrix"] = cor.loc[
