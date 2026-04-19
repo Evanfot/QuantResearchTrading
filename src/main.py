@@ -41,7 +41,9 @@ from scripts.meta_data import read_latest_meta
 
 # TODO: set meta_data, latest_market_caps to run every day
 from scripts.meta_data import get_hl_coins
-from scripts.mkt_cap_data import get_latest_market_cap
+from src.universe import (
+    get_latest_market_cap, get_top_marketcap, store_market_cap, get_universe
+)
 from src.ingestion.update_mids import run_update_mids
 from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily, update_latest_view
 from scripts.run_fill_logger import main as run_fill_logger
@@ -90,7 +92,9 @@ STATE_PATH = Path(f"state/hyperliquid_{WALLET_ADDRESS}_state.json")
 # --------------------------------------------
 DATA_HOUR_UTC = 0
 DATA_MINUTE_UTC = 1
-TRADING_EXEC_HOUR_UTC = 2  # 07:00 UTC
+MKT_CAP_HOUR_UTC = 0
+MKT_CAP_MINUTE_UTC = 5
+TRADING_EXEC_HOUR_UTC = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
 TRADING_INTENT_HOUR_UTC = 0  # 00:00 UTC
 TRADING_INTENT_MINUTE_UTC = 1
@@ -113,6 +117,13 @@ def is_data_due(now, state):
     today = now.date()
 
     return today > last and now.hour >= DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
+
+def is_mkt_cap_due(now, state):
+    last_ms = state.get("last_mkt_cap_run_ms")
+    if last_ms is None:
+        return True
+    last_run = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
+    return now.date() > last_run.date() and now.hour >= MKT_CAP_HOUR_UTC and now.minute >= MKT_CAP_MINUTE_UTC
 
 def is_trading_intent_due(now, state):
     last_run_id = state.get("last_trading_intent_run_id")
@@ -211,6 +222,17 @@ def main():
             last_ms = state.get("last_data_run_ms", 0)
             logger.info(f"[data] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {DATA_HOUR_UTC:02d}:{DATA_MINUTE_UTC:02d} UTC)")
 
+        # ---- MKT CAP TASK (daily at 00:05 UTC) ----
+        if is_mkt_cap_due(now, state):
+            logger.info("[mkt_cap] fetching latest market cap data")
+            store_market_cap(get_top_marketcap(200))
+            state["last_mkt_cap_run_ms"] = int(now.timestamp() * 1000)
+            save_state(state, STATE_PATH)
+            logger.info("[mkt_cap] complete")
+        elif first_run:
+            last_ms = state.get("last_mkt_cap_run_ms", 0)
+            logger.info(f"[mkt_cap] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {MKT_CAP_HOUR_UTC:02d}:{MKT_CAP_MINUTE_UTC:02d} UTC)")
+
         # ---- TRADING INTENT TASK (once per day at TRADING_HOUR_UTC) ----
         if is_trading_intent_due(now, state):
             logger.info("[intent] computing trading intent")
@@ -231,7 +253,7 @@ def main():
             # Get universe and initialise relevant rows in intent
             top = get_latest_market_cap()
             hl = get_hl_coins()
-            universe, symbol_index = get_hyperliquid_trading_universe(top, hl)
+            universe, symbol_index = get_universe(top, hl, state.get("universe"))
             # Get pricing and add to intent
             conn = duckdb.connect(db_path)
             hyperliquid_prices = get_ohlcv(conn)
@@ -326,6 +348,7 @@ def main():
                 intent_logger,
             )
             state["last_trading_intent_run_id"] = run_id
+            state["universe"] = universe
             save_state(state, STATE_PATH)
             logger.info(f"[intent] complete, run_id={run_id}, universe size={len(universe)}")
         elif first_run:
@@ -425,37 +448,9 @@ def main():
 
 # # %% Universe
 
-# # Known stablecoin symbols
-stable = {"USDT", "USDC", "DAI", "USDD", "FDUSD", "TUSD", "DEI", "USDP", "GUSD", "USDE"}
-
-
 def get_hyperliquid_trading_universe(top_market_cap, hl_universe):
-
-    filtered = []
-    for index, coin in top_market_cap.iterrows():
-        symbol = coin["symbol"].upper()
-        if symbol == "PAXG":
-            continue
-        if symbol in stable:
-            continue
-        if symbol in [k["symbol"] for k in filtered]:
-            continue
-        if symbol in hl_universe:
-            filtered.append(
-                {
-                    "name": coin["name"],
-                    "symbol": symbol,
-                    "market_cap": coin["market_cap"],
-                }
-            )
-
-    # Top 50 Hyperliquid-listed coins by market cap
-    result = filtered[:50]
-
-    universe = list(set([k["symbol"] for k in result]))
-
-    symbol_index = {universe[k]: k for k in range(len(universe))}
-    return universe, symbol_index
+    """Shim for analysis scripts — always returns the top-50 initial universe."""
+    return get_universe(top_market_cap, hl_universe, current_universe=None)
 
 
 def initialise_asset_intent(intent, universe):
