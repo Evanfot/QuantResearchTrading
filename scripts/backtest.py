@@ -21,8 +21,8 @@ from dotenv import load_dotenv
 from scripts.meta_data import get_hl_coins
 from scripts.mkt_cap_data import get_latest_market_cap
 from src.backtester.full_backtest import run_backtest, StrategyConfig
-from src.signal import ewmac, breakout, scaled_bollinger
-from src.main import get_hyperliquid_trading_universe, db_path, get_ohlcv, get_final_pricing
+from src.signal import ewmac, breakout, scaled_bollinger, alpha014, alpha020
+from src.main import get_hyperliquid_trading_universe, db_path, get_ohlcv, get_final_pricing, load_ohlcv_for_alphas
 # %%
 top = get_latest_market_cap()
 hl = get_hl_coins()
@@ -36,8 +36,37 @@ config = StrategyConfig()
 ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
 breakout_forecast = breakout(prices, config.breakout_window)
 bollinger_forecast = scaled_bollinger(prices, param=config.bollinger_window, scalar=1)
-mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast], axis=0)
+
+o, h, l, c_alpha, v = load_ohlcv_for_alphas(universe)
+o        = o.reindex(index=prices.index, columns=prices.columns)
+h        = h.reindex(index=prices.index, columns=prices.columns)
+l        = l.reindex(index=prices.index, columns=prices.columns)
+v        = v.reindex(index=prices.index, columns=prices.columns)
+c_alpha  = c_alpha.reindex(index=prices.index, columns=prices.columns)
+r_alpha  = np.log(c_alpha).diff()
+
+alpha014_forecast = alpha014(o, v, r_alpha)
+alpha020_forecast = alpha020(o, h, l, c_alpha)
+
+mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast,
+              alpha014_forecast, alpha020_forecast], axis=0)
 vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
 cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
 portfolio = run_backtest(prices, mu, vo, cor, config)
 portfolio.snapshot()
+
+import polars as pl
+
+positions = portfolio.cashposition
+prices = portfolio.from_cashpos_prices
+
+#TODO: Fix the import that follows
+
+from jquantstats import Portfolio
+
+
+# pf = Portfolio.from_cash_position(prices=prices, cash_position=positions, aum=1_000)
+
+# sharpe = pf.stats.sharpe()
+# fig = pf.plots.snapshot()   # call fig.show() to display
+# %%
