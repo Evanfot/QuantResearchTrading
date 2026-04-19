@@ -56,17 +56,20 @@ portfolio = run_backtest(prices, mu, vo, cor, config)
 portfolio.snapshot()
 
 import polars as pl
-
-positions = portfolio.cashposition
-prices = portfolio.from_cashpos_prices
-
-#TODO: Fix the import that follows
-
 from jquantstats import Portfolio
 
+def _to_polars_with_date(df: pd.DataFrame) -> pl.DataFrame:
+    """Convert a pandas DataFrame with DatetimeIndex to polars with a 'Date' column."""
+    return pl.from_pandas(df.reset_index().rename(columns={df.index.name or "index": "date"}))
 
-# pf = Portfolio.from_cash_position(prices=prices, cash_position=positions, aum=1_000)
+prices_pl = _to_polars_with_date(portfolio.prices)
+positions_pl = _to_polars_with_date(portfolio.cashposition)
 
-# sharpe = pf.stats.sharpe()
-# fig = pf.plots.snapshot()   # call fig.show() to display
+pf = Portfolio.from_cash_position(prices=prices_pl, cash_position=positions_pl, aum=1_000_000)
+
+sharpe = pf.stats.sharpe()
+print(f"Sharpe: {sharpe}")
+
+fig = pf.plots.snapshot()
+fig.show()
 # %%
