@@ -225,6 +225,7 @@ def main():
         if state.get("has_open_orders", False):
             logger.info("[fill_logger] open orders detected, polling fills")
             open_orders = run_fill_logger()
+            state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
@@ -236,6 +237,7 @@ def main():
         if is_position_check_due(now, state):
             logger.info("[position_check] running hourly fill log + position reconciliation")
             open_orders = run_fill_logger()
+            state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             try:
@@ -263,6 +265,7 @@ def main():
         if is_data_due(now, state):
             logger.info("[data] downloading OHLCV data")
             open_orders = run_fill_logger()
+            state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
@@ -420,6 +423,7 @@ def main():
                     print(f"Bulk submission failed: {response}")
 
             open_orders = run_fill_logger()
+            state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
