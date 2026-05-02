@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import MagicMock
 
-from src.main import get_execution_plan
+from src.execution import get_execution_plan
 
 @pytest.fixture
 def mock_context():

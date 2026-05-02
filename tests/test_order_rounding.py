@@ -1,5 +1,5 @@
 import pytest
-from src.main import get_execution_plan
+from src.execution import get_execution_plan
 
 # Size rounding (apply szDecimals to both target_qty and current_qty)
 # Refer to: https://github.com/hyperliquid-dex/hyperliquid-python-sdk/blob/master/examples/rounding.py

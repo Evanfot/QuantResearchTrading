@@ -22,7 +22,7 @@ from scripts.meta_data import get_hl_coins
 from scripts.mkt_cap_data import get_latest_market_cap
 from src.backtester.full_backtest import run_backtest, StrategyConfig
 from src.signal import ewmac, breakout, scaled_bollinger, alpha014, alpha020
-from src.main import get_hyperliquid_trading_universe, db_path, get_ohlcv, get_final_pricing, load_ohlcv_for_alphas
+from src.data import get_hyperliquid_trading_universe, db_path, get_ohlcv, get_final_pricing, load_ohlcv_for_alphas
 # %%
 top = get_latest_market_cap()
 hl = get_hl_coins()
@@ -56,7 +56,7 @@ portfolio = run_backtest(prices, mu, vo, cor, config)
 portfolio.snapshot()
 
 import polars as pl
-from jquantstats import Portfolio
+from jquantstats import Portfolio, CostModel
 
 def _to_polars_with_date(df: pd.DataFrame) -> pl.DataFrame:
     """Convert a pandas DataFrame with DatetimeIndex to polars with a 'Date' column."""
@@ -65,7 +65,7 @@ def _to_polars_with_date(df: pd.DataFrame) -> pl.DataFrame:
 prices_pl = _to_polars_with_date(portfolio.prices)
 positions_pl = _to_polars_with_date(portfolio.cashposition)
 
-pf = Portfolio.from_cash_position(prices=prices_pl, cash_position=positions_pl, aum=1_000_000)
+pf = Portfolio.from_cash_position(prices=prices_pl, cash_position=positions_pl, aum=float(portfolio.aum.iloc[0]))
 
 sharpe = pf.stats.sharpe()
 print(f"Sharpe: {sharpe}")
@@ -73,3 +73,15 @@ print(f"Sharpe: {sharpe}")
 fig = pf.plots.snapshot()
 fig.show()
 # %%
+
+# Model B: turnover-bps cost (macro, fund-of-funds)
+pf_bps = pf.from_cash_position(
+    prices=prices_pl, cash_position=positions_pl, aum=float(portfolio.aum.iloc[0]),
+    cost_model=CostModel.turnover_bps(5.0),
+)
+# Sweep Sharpe across 0 → 20 bps in a single call
+impact = pf_bps.trading_cost_impact(max_bps=20)
+# %%
+html = pf.report.to_html()
+with open("report.html", "w") as f:
+    f.write(html)
