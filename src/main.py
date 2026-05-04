@@ -14,7 +14,7 @@ from src.execution import generate_readable_summary, get_execution_plan, get_ord
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
 from src.loggers.order_logger import OrderLogger
-from src.signal import alpha014, alpha020, breakout, ewmac, scaled_bollinger
+from src.signal import alpha006, alpha014, alpha020, breakout, ewmac, scaled_bollinger
 from src.state.strategy_state import get_state_positions, load_state, save_state
 from src.universe import get_latest_market_cap, get_top_marketcap, get_universe, store_market_cap
 
@@ -35,6 +35,14 @@ logger = logging.getLogger(__name__)
 
 
 # ── Scheduling predicates ──────────────────────────────────────────────────────
+
+def is_day_open_due(now, state):
+    last_ms = state.get("last_day_open_ms")
+    if last_ms is None:
+        return True
+    last = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
+    return now.date() > last.date()
+
 
 def is_position_check_due(now, state):
     last_ms = state.get("last_position_check_ms")
@@ -221,6 +229,21 @@ def main():
                 f"fills_logged_at_ms={state.get('fills_logged_at_ms')}"
             )
 
+        # ── Day-open snapshot (once per calendar day, first tick after midnight) ─
+        if is_day_open_due(now, state):
+            try:
+                from src.ingestion.update_mids import get_all_ltps
+                from hyperliquid.info import Info
+                from hyperliquid.utils.constants import MAINNET_API_URL
+                _info = Info(MAINNET_API_URL, skip_ws=True)
+                _day_open = get_all_ltps(_info)
+                _day_open.to_csv("data/snapshots/day_open.csv", index=False)
+                state["last_day_open_ms"] = int(now.timestamp() * 1000)
+                save_state(state, STATE_PATH)
+                logger.info("[day_open] snapshot saved")
+            except Exception:
+                logger.warning("[day_open] failed to save snapshot")
+
         # ── Fill logger ────────────────────────────────────────────────────────
         if state.get("has_open_orders", False):
             logger.info("[fill_logger] open orders detected, polling fills")
@@ -334,10 +357,11 @@ def main():
             c_alpha  = c_alpha.reindex(index=prices.index, columns=prices.columns)
             r_alpha  = np.log(c_alpha).diff()
 
+            alpha006_forecast = alpha006(o, v)
             alpha014_forecast = alpha014(o, v, r_alpha)
             alpha020_forecast = alpha020(o, h, l, c_alpha)
 
-            mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast, alpha014_forecast, alpha020_forecast], axis=0)
+            mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast, alpha006_forecast, alpha014_forecast, alpha020_forecast], axis=0)
             vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
             cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
 

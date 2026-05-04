@@ -24,27 +24,30 @@ def scaled_bollinger(price, param=20, scalar=2, forecast_cap=10):
     return forecast.values
 
 
+def alpha006(o, v, window=10):
+    """-1 * ts_corr(open, volume, window)
+    Negative open-volume correlation: when open price and volume have been moving together recently, expect mean reversion.
+    """
+    raw = -o.rolling(window).corr(v).replace([-np.inf, np.inf], np.nan)
+    demeaned = raw.sub(raw.mean(axis=1), axis=0)
+    return np.nan_to_num(demeaned.values, nan=0.0)
+
+
 def alpha014(o, v, r):
     """-rank(ts_delta(returns, 3)) * ts_corr(open, volume, 10)
-
     Mean-reversion signal modulated by open/volume correlation.
-    Inputs are DataFrames of shape (time × symbols), aligned to prices index.
-    Returns a numpy array of the same shape, normalised to [-1, 1].
     """
     raw = (
         -r.diff(3).rank(axis=1, pct=True)
         .mul(o.rolling(10).corr(v).replace([-np.inf, np.inf], np.nan))
     )
     demeaned = raw.sub(raw.mean(axis=1), axis=0)
-    return np.nan_to_num(np.tanh(demeaned).values, nan=0.0)
+    return np.nan_to_num(demeaned.values, nan=0.0)
 
 
 def alpha020(o, h, l, c):
     """-rank(open-lag(high,1)) * rank(open-lag(close,1)) * rank(open-lag(low,1))
-
     Gap-open signal: how today's open sits relative to yesterday's range.
-    Inputs are DataFrames of shape (time × symbols), aligned to prices index.
-    Returns a numpy array of the same shape, normalised to [-1, 1].
     """
     raw = (
         -( o - h.shift(1)).rank(axis=1, pct=True)
@@ -52,7 +55,7 @@ def alpha020(o, h, l, c):
         .mul((o - l.shift(1)).rank(axis=1, pct=True))
     )
     demeaned = raw.sub(raw.mean(axis=1), axis=0)
-    return np.nan_to_num(np.tanh(demeaned).values, nan=0.0)
+    return np.nan_to_num(demeaned.values, nan=0.0)
 
 
 def carry_signal(

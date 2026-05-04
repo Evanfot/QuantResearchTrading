@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from scripts.meta_data import get_hl_coins
 from scripts.mkt_cap_data import get_latest_market_cap
 from src.backtester.full_backtest import run_backtest, StrategyConfig
-from src.signal import ewmac, breakout, scaled_bollinger, alpha014, alpha020
+from src.signal import ewmac, breakout, scaled_bollinger, alpha006, alpha014, alpha020
 from src.data import get_hyperliquid_trading_universe, db_path, get_ohlcv, get_final_pricing, load_ohlcv_for_alphas
 # %%
 top = get_latest_market_cap()
@@ -45,11 +45,12 @@ v        = v.reindex(index=prices.index, columns=prices.columns)
 c_alpha  = c_alpha.reindex(index=prices.index, columns=prices.columns)
 r_alpha  = np.log(c_alpha).diff()
 
+alpha006_forecast = alpha006(o, v)
 alpha014_forecast = alpha014(o, v, r_alpha)
 alpha020_forecast = alpha020(o, h, l, c_alpha)
 
 mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast,
-              alpha014_forecast, alpha020_forecast], axis=0)
+              alpha006_forecast, alpha014_forecast, alpha020_forecast], axis=0)
 vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
 cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
 portfolio = run_backtest(prices, mu, vo, cor, config)
