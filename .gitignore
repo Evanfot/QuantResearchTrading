@@ -10,7 +10,8 @@ config.json
 *.duckdb
 # State
 state/
-
+# Analysis folder
+analysis/
 Notes.md
 .vscode/
 *.cache

@@ -102,39 +102,24 @@ class FillLogger:
 
 
         record = {
-            "event_type": "fill",
-            "run_id": run_id,
-
-            "exchange": exchange,
-            "account": account,
-
+            "fill_timestamp_ms": int(fill["time"]),
             "coin": fill["coin"],
             "side": side_str,
-
-            # --- IDs ---
+            "qty": signed_qty,          # ← THIS MUST BE SIGNED
+            "price": price,
+            "event_type": "fill",
+            "run_id": run_id,
+            "exchange": exchange,
+            "account": account,
             "fill_id": fill["tid"],          # primary deduplication key
             "order_id": fill["oid"],
-
-            # --- Time ---
-            "fill_timestamp_ms": int(fill["time"]),
-
-            # --- Economics ---
-            "price": price,
-            "qty": signed_qty,          # ← THIS MUST BE SIGNED
             "notional": notional,
-
             "fee": float(fill["fee"]),
             "fee_currency": fill.get("feeToken", "UNKNOWN"),
-
-            # --- Execution metadata ---
             "liquidity": "taker" if fill.get("crossed") else "maker",
             "direction": fill.get("dir"),
             "closed_pnl": float(fill.get("closedPnl", 0.0)),
-
-            # --- Provenance ---
             "source": source,
-
-            # --- Raw exchange data (always keep) ---
             "raw_fill": fill,
         }
 
