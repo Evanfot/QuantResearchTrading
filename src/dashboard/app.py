@@ -107,25 +107,13 @@ def load_last_fill_ms():
 
 
 def load_open_orders_count():
-    """Count submitted orders from the most recent run_id that aren't filled."""
-    import json as _json
-    path = root / f"logs/orders_{TRADING_ENV}.jsonl"
-    if not path.exists():
+    """Count live open orders from the exchange."""
+    try:
+        from src.config import make_info, open_orders, WALLET_ADDRESS
+        info = make_info()
+        return len(open_orders(info, WALLET_ADDRESS))
+    except Exception:
         return 0
-    rows = []
-    with open(path) as fh:
-        for line in fh:
-            try:
-                rows.append(_json.loads(line))
-            except Exception:
-                pass
-    if not rows:
-        return 0
-    latest_run = max(r["run_id"] for r in rows)
-    return sum(
-        1 for r in rows
-        if r.get("run_id") == latest_run and r.get("exchange_status") != "filled"
-    )
 
 
 def load_heartbeat_ms():
