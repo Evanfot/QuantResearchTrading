@@ -12,7 +12,7 @@ services:
       - ./state:/app/state
       - ./data:/app/data
     command: python -m src.main
-dashboard:
+  dashboard:
     build:
       context: .
       dockerfile: docker/Dockerfile
