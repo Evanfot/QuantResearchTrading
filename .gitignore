@@ -9,7 +9,7 @@ config.json
 .git/
 *.duckdb
 # State
-state/
+/state/
 # Analysis folder
 analysis/
 Notes.md
