@@ -236,8 +236,6 @@ config.json
 *.log
 .git/
 *.duckdb
-# State
-state/
 
 Notes.md
 .vscode/
