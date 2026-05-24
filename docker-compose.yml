@@ -12,3 +12,18 @@ services:
       - ./state:/app/state
       - ./data:/app/data
     command: python -m src.main
+dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./state:/app/state
+      - ./data:/app/data
+    ports:
+      - "8050:8050"
+    command: python -m src.dashboard.app
