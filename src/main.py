@@ -201,6 +201,10 @@ def main():
     os.chdir(root)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    _err_handler = logging.FileHandler("logs/errors.log")
+    _err_handler.setLevel(logging.ERROR)
+    _err_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(_err_handler)
 
     load_dotenv()
     PRIVATE_KEY = os.getenv("HYPERLIQUID_PRIVATE_KEY")
@@ -217,9 +221,9 @@ def main():
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         run_id = generate_run_id()
+        Path("state/heartbeat.ms").write_text(str(int(now.timestamp() * 1000)))
 
         if first_run:
-            logger.setLevel(logging.INFO)
             logger.info(f"[startup] loop started at {now.isoformat()}")
             logger.info(
                 f"[startup] state loaded: last_data_run_ms={state.get('last_data_run_ms')}, "
@@ -246,19 +250,16 @@ def main():
 
         # ── Fill logger ────────────────────────────────────────────────────────
         if state.get("has_open_orders", False):
-            logger.info("[fill_logger] open orders detected, polling fills")
             open_orders = run_fill_logger()
             state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
-            logger.info(f"[fill_logger] done, open_orders remaining: {len(open_orders)}")
         elif first_run:
             logger.info("[fill_logger] no open orders, skipping tick poll")
 
         # ── Position reconciliation (hourly) ───────────────────────────────────
         if is_position_check_due(now, state):
-            logger.info("[position_check] running hourly fill log + position reconciliation")
             open_orders = run_fill_logger()
             state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
@@ -273,10 +274,12 @@ def main():
                 diff = dict_diff(exchange_positions, state_positions)
                 if diff["changed"]:
                     logger.warning(f"Position mismatch — state vs exchange: {diff['changed']}")
+                    state["positions_match_exchange"] = False
                 else:
-                    logger.info(f"[position_check] {len(state_positions)} positions match exchange")
+                    state["positions_match_exchange"] = True
             except Exception:
                 logger.warning("Position check failed: could not reach exchange")
+                state["positions_match_exchange"] = None
             state["last_position_check_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
         elif first_run:
@@ -304,14 +307,14 @@ def main():
 
         # ── Market cap task (daily at 00:05 UTC) ───────────────────────────────
         if is_mkt_cap_due(now, state):
-            logger.info("[mkt_cap] fetching latest market cap data")
+            logger.debug("[mkt_cap] fetching latest market cap data")
             store_market_cap(get_top_marketcap(200))
             state["last_mkt_cap_run_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
-            logger.info("[mkt_cap] complete")
+            logger.debug("[mkt_cap] complete")
         elif first_run:
             last_ms = state.get("last_mkt_cap_run_ms", 0)
-            logger.info(f"[mkt_cap] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {MKT_CAP_HOUR_UTC:02d}:{MKT_CAP_MINUTE_UTC:02d} UTC)")
+            logger.debug(f"[mkt_cap] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {MKT_CAP_HOUR_UTC:02d}:{MKT_CAP_MINUTE_UTC:02d} UTC)")
 
         # ── Trading intent task (daily) ────────────────────────────────────────
         if is_trading_intent_due(now, state):
@@ -418,9 +421,9 @@ def main():
                 open_orders = info.open_orders(WALLET_ADDRESS)
                 if open_orders:
                     cancels = [{"coin": o["coin"], "oid": o["oid"]} for o in open_orders]
-                    logger.info(f"Cancel Requests: {cancels}")
+                    logger.debug(f"Cancel Requests: {cancels}")
                     resp = ex.bulk_cancel(cancels)
-                    logger.info(f"Cancel Response: {resp}")
+                    logger.debug(f"Cancel Response: {resp}")
 
             orders = get_execution_plan(order_intentions, ltps, sz_decimals, logger, positions=positions)
 
@@ -442,7 +445,7 @@ def main():
                             qty=order_info["sz"],
                             response={"response": {"data": {"statuses": [status]}}},
                         )
-                    logging.info("Rebalancing complete.")
+                    logging.info(f"[exec] Rebalance triggered — {len(orders)} orders submitted")
                 else:
                     print(f"Bulk submission failed: {response}")
 
@@ -452,15 +455,12 @@ def main():
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
-            logger.info(f"[exec] complete, orders placed: {len(orders) if orders else 0}")
         elif first_run:
             last_ms = state.get("last_trading_exec_ms", 0)
             next_due = dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc) + dt.timedelta(minutes=TRADING_EXEC_INTERVAL_MINUTES)
-            logger.info(f"[exec] not due (last: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, next: {next_due.isoformat()}, gate: after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC)")
+            logger.debug(f"[exec] not due (last: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, next: {next_due.isoformat()}, gate: after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC)")
 
         if first_run:
-            logger.info("[startup] first iteration complete, switching to ERROR-only logging")
-            logger.setLevel(logging.ERROR)
             first_run = False
 
         sleep_until_next_tick(state)

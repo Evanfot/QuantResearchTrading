@@ -1,13 +1,16 @@
 # %%
-import ccxt
 import asyncio
 import concurrent.futures
+import logging
+import os
+
+import ccxt
+import duckdb
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 import datetime as dt
-import duckdb
-from tqdm.asyncio import tqdm_asyncio
-import os
+
+logger = logging.getLogger(__name__)
 
 # === CONFIGURATION ===
 from dotenv import load_dotenv
@@ -129,7 +132,7 @@ async def fetch_symbol(symbol: str):
                 limit=LIMIT
             )
         except Exception as e:
-            print(f"[{symbol}] Error: {e}")
+            logger.warning(f"[data] {symbol} fetch error: {e}")
             await asyncio.sleep(2)
             continue
 
@@ -154,7 +157,6 @@ async def fetch_symbol(symbol: str):
 async def dl(symbols=None):
     if symbols is None:
         symbols = exchange.symbols
-    print(f"Fetching {len(symbols)} symbols...")
 
     semaphore = asyncio.Semaphore(5)
 
@@ -162,20 +164,9 @@ async def dl(symbols=None):
         async with semaphore:
             return await fetch_symbol(symbol)
 
-    results = []
-    tasks = [sem_task(s) for s in symbols]
-
-    for coro in tqdm_asyncio.as_completed(
-        tasks,
-        total=len(tasks),
-        desc="Progress"
-    ):
-        msg = await coro
-        results.append(msg)
-
-    print("\n=== Summary ===")
-    for r in results:
-        print(r)
+    results = await asyncio.gather(*[sem_task(s) for s in symbols])
+    updated = sum(1 for r in results if r and "Inserted" in r)
+    logger.info(f"[data] updated for {updated} symbols")
 
 
 def _run_async(coro):

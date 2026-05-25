@@ -1,6 +1,7 @@
 # %%
 import time
 import os
+import logging
 from pathlib import Path
 import json
 import datetime as dt
@@ -30,7 +31,6 @@ def main():
     assert state["exchange"] == 'hyperliquid'
     assert state["address"] == WALLET_ADDRESS
     assert state["schema_version"] == 1.2
-    print(f"[fill_logger] cursor={last_ts}, run_id={fill_run_id}")
 
     try:
         raw_fills = info.user_fills_by_time(WALLET_ADDRESS, last_ts)
@@ -45,6 +45,8 @@ def main():
                 max_seen_ts = max(max_seen_ts, ts)
 
         if fills_to_commit:
+            coins = ", ".join(sorted({f["coin"] for f in fills_to_commit}))
+            logging.info(f"[fill_logger] {len(fills_to_commit)} new fill(s) detected — {coins}")
             fill_logger.log_fills(
                 run_id=fill_run_id,
                 exchange=exchange,
@@ -70,7 +72,7 @@ def main():
             state["positions"] = positions
             save_state(state,STATE_PATH)
     except Exception as e:
-        print(f"[fill_logger] error: {e}")
+        logging.warning(f"[fill_logger] error: {e}")
 
     return info.open_orders(WALLET_ADDRESS)
 

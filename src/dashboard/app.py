@@ -67,12 +67,94 @@ def _is_exec_due(now, state):
     return (now - last).total_seconds() >= TRADING_EXEC_INTERVAL_MINUTES * 60
 
 
+def _is_mkt_cap_due(now, state):
+    last_ms = state.get("last_mkt_cap_run_ms")
+    if last_ms is None:
+        return True
+    last = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
+    return now.date() > last.date() and now.hour >= MKT_CAP_HOUR_UTC and now.minute >= MKT_CAP_MINUTE_UTC
+
+
 def _is_fills_stale(now, state):
     last_ms = state.get("fills_logged_at_ms")
     if last_ms is None:
         return True
     last = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
     return (now - last).total_seconds() >= POSITION_CHECK_INTERVAL_HOURS * 3600
+
+
+# ---------------------------------------------------------------------------
+# System health helpers
+# ---------------------------------------------------------------------------
+
+def load_last_fill_ms():
+    """Most recent fill_timestamp_ms from fills.jsonl, or None."""
+    import json as _json
+    path = root / "logs/fills.jsonl"
+    if not path.exists():
+        return None
+    best = None
+    with open(path) as fh:
+        for line in fh:
+            try:
+                ts = _json.loads(line).get("fill_timestamp_ms")
+                if ts and (best is None or ts > best):
+                    best = ts
+            except Exception:
+                pass
+    return best
+
+
+def load_open_orders_count():
+    """Count submitted orders from the most recent run_id that aren't filled."""
+    import json as _json
+    path = root / "logs/orders.jsonl"
+    if not path.exists():
+        return 0
+    rows = []
+    with open(path) as fh:
+        for line in fh:
+            try:
+                rows.append(_json.loads(line))
+            except Exception:
+                pass
+    if not rows:
+        return 0
+    latest_run = max(r["run_id"] for r in rows)
+    return sum(
+        1 for r in rows
+        if r.get("run_id") == latest_run and r.get("exchange_status") != "filled"
+    )
+
+
+def load_heartbeat_ms():
+    """Last loop-run timestamp written by main.py, or None."""
+    path = root / "state/heartbeat.ms"
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text().strip())
+    except Exception:
+        return None
+
+
+def load_error_count_24h():
+    """Count ERROR lines in logs/errors.log written in the last 24 hours."""
+    path = root / "logs/errors.log"
+    if not path.exists():
+        return 0
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+    count = 0
+    with open(path) as fh:
+        for line in fh:
+            try:
+                ts_str = line[:23]
+                ts = dt.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=dt.timezone.utc)
+                if ts >= cutoff:
+                    count += 1
+            except Exception:
+                pass
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -361,20 +443,48 @@ def _fmt_ms(ms):
     return dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _positions_match_str(state):
+    v = state.get("positions_match_exchange")
+    if v is None:
+        return "Unknown"
+    return "Match" if v else "Mismatch"
+
+
+def _positions_match_red(state):
+    v = state.get("positions_match_exchange")
+    return v is not True  # red if mismatch or never checked
+
+
 def build_status_lights(now, state):
-    data_stale   = _is_data_due(now, state)
-    intent_stale = _is_intent_due(now, state)
-    exec_stale   = _is_exec_due(now, state)
-    fills_stale  = _is_fills_stale(now, state)
+    data_stale    = _is_data_due(now, state)
+    intent_stale  = _is_intent_due(now, state)
+    exec_stale    = _is_exec_due(now, state)
+    fills_stale   = _is_fills_stale(now, state)
+    mkt_cap_stale = _is_mkt_cap_due(now, state)
 
     run_id = state.get("last_trading_intent_run_id") or "—"
     run_id_display = run_id.split("_")[0] if "_" in run_id else run_id
 
+    # System health indicators
+    open_orders   = load_open_orders_count()
+    last_fill_ms  = load_last_fill_ms()
+    heartbeat_ms  = load_heartbeat_ms()
+    error_count   = load_error_count_24h()
+
+    heartbeat_stale = heartbeat_ms is None or (now.timestamp() * 1000 - heartbeat_ms) > 5 * 60 * 1000
+    heartbeat_val = _fmt_ms(heartbeat_ms) if heartbeat_ms else "—"
+
     items = [
-        ("Data Updated",     _fmt_ms(state.get("last_data_run_ms")),      f"Due after {DATA_HOUR_UTC:02d}:{DATA_MINUTE_UTC:02d} UTC daily",          data_stale),
-        ("Trading Intent",   run_id_display,                               f"Due after {TRADING_INTENT_HOUR_UTC:02d}:{TRADING_INTENT_MINUTE_UTC:02d} UTC daily", intent_stale),
-        ("Last Execution",   _fmt_ms(state.get("last_trading_exec_ms")),   f"Every {TRADING_EXEC_INTERVAL_MINUTES}min after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC", exec_stale),
-        ("Fills Logged At",  _fmt_ms(state.get("fills_logged_at_ms")),     f"Every {POSITION_CHECK_INTERVAL_HOURS}h",                                 fills_stale),
+        ("Data Updated",     _fmt_ms(state.get("last_data_run_ms")),        f"Due after {DATA_HOUR_UTC:02d}:{DATA_MINUTE_UTC:02d} UTC daily",            data_stale),
+        ("Market Cap",       _fmt_ms(state.get("last_mkt_cap_run_ms")),    f"Due after {MKT_CAP_HOUR_UTC:02d}:{MKT_CAP_MINUTE_UTC:02d} UTC daily",      mkt_cap_stale),
+        ("Trading Intent",   run_id_display,                                f"Due after {TRADING_INTENT_HOUR_UTC:02d}:{TRADING_INTENT_MINUTE_UTC:02d} UTC daily", intent_stale),
+        ("Last Execution",   _fmt_ms(state.get("last_trading_exec_ms")),    f"Every {TRADING_EXEC_INTERVAL_MINUTES}min after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC", exec_stale),
+        ("Fills Logged At",  _fmt_ms(state.get("fills_logged_at_ms")),      f"Every {POSITION_CHECK_INTERVAL_HOURS}h",                                   fills_stale),
+        ("Positions Match",   _positions_match_str(state),                  f"Checked every {POSITION_CHECK_INTERVAL_HOURS}h · last {_fmt_ms(state.get('last_position_check_ms'))}", _positions_match_red(state)),
+        ("Open Orders",      str(open_orders),                             "From latest rebalance run",                                               open_orders > 10),
+        ("Last Fill",        _fmt_ms(last_fill_ms),                        "Most recent order filled",                                                last_fill_ms is None),
+        ("System Heartbeat", heartbeat_val,                                "🔴 if loop silent > 5 min",                                               heartbeat_stale),
+        ("Errors (24h)",     str(error_count),                             "ERROR-level log entries",                                                 error_count > 0),
     ]
 
     cards = []
