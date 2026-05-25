@@ -12,6 +12,7 @@ services:
       - ./state:/app/state
       - ./data:/app/data
     command: python -m src.main
+
   dashboard:
     build:
       context: .
@@ -26,4 +27,38 @@ services:
       - ./data:/app/data
     ports:
       - "8050:8050"
+    command: python -m src.dashboard.app
+
+  trader-testnet:
+    profiles: [testnet]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: trader-testnet
+    restart: unless-stopped
+    env_file:
+      - .env
+      - .env.testnet
+    volumes:
+      - ./logs-testnet:/app/logs
+      - ./state:/app/state
+      - ./data:/app/data
+    command: python -m src.main
+
+  dashboard-testnet:
+    profiles: [testnet]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: dashboard-testnet
+    restart: unless-stopped
+    env_file:
+      - .env
+      - .env.testnet
+    volumes:
+      - ./logs-testnet:/app/logs
+      - ./state:/app/state
+      - ./data:/app/data
+    ports:
+      - "8051:8050"
     command: python -m src.dashboard.app

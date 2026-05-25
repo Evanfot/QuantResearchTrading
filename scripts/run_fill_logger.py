@@ -1,26 +1,21 @@
 # %%
-import time
-import os
+import logging
 from pathlib import Path
-import json
 import datetime as dt
 from src.loggers.fill_logger import FillLogger
-from dotenv import load_dotenv
-load_dotenv()
-WALLET_ADDRESS = os.getenv("HYPERLIQUID_WALLET_ADDRESS")
-
-STATE_PATH = Path(f"state/hyperliquid_{WALLET_ADDRESS}_state.json")
+from src.config import HL_API_URL, WALLET_ADDRESS, TRADING_ENV
 from src.state.strategy_state import load_state, save_state
 
 from hyperliquid.info import Info
-from hyperliquid.utils.constants import MAINNET_API_URL
 from src.positions.position_rebuilder import PositionRebuilder
+
+STATE_PATH = Path(f"state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json")
 
 def main():
     """Run one fill-logger poll cycle. Returns open_orders so the caller can loop."""
     exchange = "hyperliquid"
 
-    info = Info(MAINNET_API_URL, skip_ws=True)
+    info = Info(HL_API_URL, skip_ws=True)
     fill_logger = FillLogger("logs/fills.jsonl")
 
     fill_run_id = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -28,9 +23,10 @@ def main():
     last_ts = state["last_fill_timestamp_ms"]
     state_positions = state["positions"]
     assert state["exchange"] == 'hyperliquid'
-    assert state["address"] == WALLET_ADDRESS
     assert state["schema_version"] == 1.2
-    print(f"[fill_logger] cursor={last_ts}, run_id={fill_run_id}")
+    if state.get("address") and state["address"] != WALLET_ADDRESS:
+        raise RuntimeError(f"State address mismatch: file has {state['address']}, expected {WALLET_ADDRESS}")
+    state["address"] = WALLET_ADDRESS
 
     try:
         raw_fills = info.user_fills_by_time(WALLET_ADDRESS, last_ts)
@@ -45,6 +41,8 @@ def main():
                 max_seen_ts = max(max_seen_ts, ts)
 
         if fills_to_commit:
+            coins = ", ".join(sorted({f["coin"] for f in fills_to_commit}))
+            logging.info(f"[fill_logger] {len(fills_to_commit)} new fill(s) detected — {coins}")
             fill_logger.log_fills(
                 run_id=fill_run_id,
                 exchange=exchange,
@@ -70,7 +68,7 @@ def main():
             state["positions"] = positions
             save_state(state,STATE_PATH)
     except Exception as e:
-        print(f"[fill_logger] error: {e}")
+        logging.warning(f"[fill_logger] error: {e}")
 
     return info.open_orders(WALLET_ADDRESS)
 

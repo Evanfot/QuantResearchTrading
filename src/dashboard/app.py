@@ -436,10 +436,8 @@ def build_page():
     exchange_state = read_latest_exchange_state()
     intent = intent_logger.read_latest() or {}
 
-    from dotenv import load_dotenv
-    load_dotenv()
-    wallet = os.getenv("HYPERLIQUID_WALLET_ADDRESS", "unknown")
-    state_path = root / f"state/hyperliquid_{wallet}_state.json"
+    from src.config import WALLET_ADDRESS as wallet, TRADING_ENV
+    state_path = root / f"state/hyperliquid_{TRADING_ENV}_{wallet}_state.json"
     try:
         strategy_state = load_state(state_path)
     except Exception:

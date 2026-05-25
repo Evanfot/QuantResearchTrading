@@ -8,7 +8,7 @@ from pathlib import Path
 import json
 import hashlib
 from hyperliquid.info import Info
-from hyperliquid.utils.constants import MAINNET_API_URL
+from src.config import HL_API_URL
 
 # === CONFIGURATION ===
 from dotenv import load_dotenv
@@ -98,7 +98,7 @@ def insert_into_duckdb(db_path, mids):
 
 def run_update_mids():
     logfile = Path(f"{db_dir}/logs/mids_cron.log")
-    info = Info(MAINNET_API_URL, skip_ws=True)
+    info = Info(HL_API_URL, skip_ws=True)
     mids = get_all_ltps(info)
     init_duckdb_table(db_path)
     insert_into_duckdb(db_path, mids)
