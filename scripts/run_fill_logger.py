@@ -3,10 +3,9 @@ import logging
 from pathlib import Path
 import datetime as dt
 from src.loggers.fill_logger import FillLogger
-from src.config import HL_API_URL, WALLET_ADDRESS, TRADING_ENV
+from src.config import make_info, open_orders as hl_open_orders, WALLET_ADDRESS, TRADING_ENV
 from src.state.strategy_state import load_state, save_state
 
-from hyperliquid.info import Info
 from src.positions.position_rebuilder import PositionRebuilder
 
 STATE_PATH = Path(f"state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json")
@@ -15,8 +14,8 @@ def main():
     """Run one fill-logger poll cycle. Returns open_orders so the caller can loop."""
     exchange = "hyperliquid"
 
-    info = Info(HL_API_URL, skip_ws=True)
-    fill_logger = FillLogger("logs/fills.jsonl")
+    info = make_info()
+    fill_logger = FillLogger(f"logs/fills_{TRADING_ENV}.jsonl")
 
     fill_run_id = dt.datetime.now(dt.timezone.utc).isoformat()
     state = load_state(STATE_PATH)
@@ -70,7 +69,7 @@ def main():
     except Exception as e:
         logging.warning(f"[fill_logger] error: {e}")
 
-    return info.open_orders(WALLET_ADDRESS)
+    return hl_open_orders(info, WALLET_ADDRESS)
 
 
 if 0:

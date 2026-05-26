@@ -54,6 +54,19 @@ docker-compose --profile testnet up
 
 The default `docker-compose up` (no profile) only starts mainnet services.
 
+### Manually triggering tasks
+
+Edit the state file (`state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json`) and restart.
+
+| To trigger | State field | Replace current value with |
+|---|---|---|
+| Trading intent | `last_trading_intent_run_id` | `""` |
+| Execution | `last_trading_exec_ms` | `0` |
+| OHLCV data download | `last_data_run_ms` | `0` |
+| Market cap update | `last_mkt_cap_run_ms` | `0` |
+| Position check | `last_position_check_ms` | `0` |
+| Exchange meta | run `python -m scripts.meta_data` | — |
+
 ### Backtest output:
 - Generated 2026/05/09 using scripts.backtest
 - Output saved as ipynb in Examples

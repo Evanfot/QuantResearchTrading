@@ -21,8 +21,9 @@ from scripts.exchange_state import read_latest_exchange_state
 from src.loggers.intent_logger import IntentLogger
 from src.positions.position_rebuilder import PositionRebuilder
 from src.state.strategy_state import load_state
+from src.config import TRADING_ENV
 
-intent_logger = IntentLogger("logs/intent.jsonl")
+intent_logger = IntentLogger(f"logs/intent_{TRADING_ENV}.jsonl")
 
 REFRESH_SECONDS = 30
 
@@ -82,7 +83,7 @@ def _is_fills_stale(now, state):
 def load_fills_split():
     """Read fills.jsonl and split at today's 00:00 UTC into (prev_fills, today_fills)."""
     import json as _json
-    path = root / "logs/fills.jsonl"
+    path = root / f"logs/fills_{TRADING_ENV}.jsonl"
     if not path.exists():
         return [], []
     records = []

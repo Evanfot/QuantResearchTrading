@@ -4,15 +4,14 @@ import requests
 from datetime import datetime,timezone
 from pathlib import Path
 
-from hyperliquid.info import Info
-from src.config import HL_API_URL, WALLET_ADDRESS
+from src.config import make_info, WALLET_ADDRESS
 
 exchange_state_DIR = Path("data/hyperliquid_exchange_state")
 exchange_state_DIR.mkdir(exist_ok=True)
 address = WALLET_ADDRESS
 
 def fetch_exchange_state():
-    info = Info(HL_API_URL, skip_ws=True)
+    info = make_info()
     exchange_state = info.user_state(address)
     return exchange_state
 
