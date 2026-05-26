@@ -23,6 +23,8 @@ DATA_HOUR_UTC = 0
 DATA_MINUTE_UTC = 1
 MKT_CAP_HOUR_UTC = 0
 MKT_CAP_MINUTE_UTC = 5
+META_HOUR_UTC = 23
+META_MINUTE_UTC = 45
 TRADING_EXEC_HOUR_UTC = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
 TRADING_INTENT_HOUR_UTC = 0
@@ -70,6 +72,14 @@ def is_data_due(now, state):
     except Exception:
         pass
     return True
+
+
+def is_meta_due(now, state):
+    last_ms = state.get("last_meta_run_ms")
+    if not last_ms:
+        return True
+    last_run = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
+    return now.date() > last_run.date() and now.hour >= META_HOUR_UTC and now.minute >= META_MINUTE_UTC
 
 
 def is_mkt_cap_due(now, state):
@@ -323,6 +333,20 @@ def main():
         elif first_run:
             last_ms = state.get("last_mkt_cap_run_ms", 0)
             logger.debug(f"[mkt_cap] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {MKT_CAP_HOUR_UTC:02d}:{MKT_CAP_MINUTE_UTC:02d} UTC)")
+
+        # ── Exchange meta task (daily at 23:45 UTC) ───────────────────────────
+        if is_meta_due(now, state):
+            try:
+                from scripts.meta_data import fetch_meta, store_meta
+                store_meta(fetch_meta())
+                state["last_meta_run_ms"] = int(now.timestamp() * 1000)
+                save_state(state, STATE_PATH)
+                logger.info("[meta] snapshot saved")
+            except Exception:
+                logger.warning("[meta] failed to fetch exchange meta", exc_info=True)
+        elif first_run:
+            last_ms = state.get("last_meta_run_ms", 0)
+            logger.info(f"[meta] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {META_HOUR_UTC:02d}:{META_MINUTE_UTC:02d} UTC)")
 
         # ── Trading intent task (daily) ────────────────────────────────────────
         if is_trading_intent_due(now, state):
