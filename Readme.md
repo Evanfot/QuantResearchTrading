@@ -65,7 +65,7 @@ Edit the state file (`state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.jso
 | OHLCV data download | `last_data_run_ms` | `0` |
 | Market cap update | `last_mkt_cap_run_ms` | `0` |
 | Position check | `last_position_check_ms` | `0` |
-| Exchange meta | run `python -m scripts.meta_data` | — |
+| Exchange meta | `last_meta_run_ms` | `0` |
 
 ### Backtest output:
 - Generated 2026/05/09 using scripts.backtest
