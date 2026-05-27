@@ -68,12 +68,94 @@ def _is_exec_due(now, state):
     return (now - last).total_seconds() >= TRADING_EXEC_INTERVAL_MINUTES * 60
 
 
+def _is_mkt_cap_due(now, state):
+    last_ms = state.get("last_mkt_cap_run_ms")
+    if last_ms is None:
+        return True
+    last = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
+    return now.date() > last.date() and now.hour >= MKT_CAP_HOUR_UTC and now.minute >= MKT_CAP_MINUTE_UTC
+
+
 def _is_fills_stale(now, state):
     last_ms = state.get("fills_logged_at_ms")
     if last_ms is None:
         return True
     last = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
     return (now - last).total_seconds() >= POSITION_CHECK_INTERVAL_HOURS * 3600
+
+
+# ---------------------------------------------------------------------------
+# System health helpers
+# ---------------------------------------------------------------------------
+
+def load_last_fill_ms():
+    """Most recent fill_timestamp_ms from fills.jsonl, or None."""
+    import json as _json
+    path = root / "logs/fills.jsonl"
+    if not path.exists():
+        return None
+    best = None
+    with open(path) as fh:
+        for line in fh:
+            try:
+                ts = _json.loads(line).get("fill_timestamp_ms")
+                if ts and (best is None or ts > best):
+                    best = ts
+            except Exception:
+                pass
+    return best
+
+
+def load_open_orders_count():
+    """Count submitted orders from the most recent run_id that aren't filled."""
+    import json as _json
+    path = root / "logs/orders.jsonl"
+    if not path.exists():
+        return 0
+    rows = []
+    with open(path) as fh:
+        for line in fh:
+            try:
+                rows.append(_json.loads(line))
+            except Exception:
+                pass
+    if not rows:
+        return 0
+    latest_run = max(r["run_id"] for r in rows)
+    return sum(
+        1 for r in rows
+        if r.get("run_id") == latest_run and r.get("exchange_status") != "filled"
+    )
+
+
+def load_heartbeat_ms():
+    """Last loop-run timestamp written by main.py, or None."""
+    path = root / "state/heartbeat.ms"
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text().strip())
+    except Exception:
+        return None
+
+
+def load_error_count_24h():
+    """Count ERROR lines in logs/errors.log written in the last 24 hours."""
+    path = root / "logs/errors.log"
+    if not path.exists():
+        return 0
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+    count = 0
+    with open(path) as fh:
+        for line in fh:
+            try:
+                ts_str = line[:23]
+                ts = dt.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=dt.timezone.utc)
+                if ts >= cutoff:
+                    count += 1
+            except Exception:
+                pass
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +297,12 @@ body{{background:#0d0f14;color:#e2e8f0;font-family:'SF Mono','Fira Code',monospa
 header{{padding:14px 24px;border-bottom:1px solid #1e2433;display:flex;justify-content:space-between;align-items:center}}
 header h1{{font-size:13px;font-weight:600;color:#94a3b8;letter-spacing:.1em;text-transform:uppercase}}
 .ts{{color:#334155;font-size:12px}}
+.tabs{{display:flex;gap:0;padding:0 24px;border-bottom:1px solid #1e2433}}
+.tab-btn{{background:none;border:none;border-bottom:2px solid transparent;color:#475569;font-family:inherit;font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;padding:10px 18px;cursor:pointer;margin-bottom:-1px}}
+.tab-btn.active{{color:#e2e8f0;border-bottom-color:#38bdf8}}
+.tab-btn:hover:not(.active){{color:#94a3b8}}
+.tab-panel{{display:none}}
+.tab-panel.active{{display:block}}
 .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;padding:20px 24px}}
 .card{{background:#131720;border:1px solid #1e2433;border-radius:8px;padding:16px 18px}}
 .card .lbl{{color:#475569;font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}}
@@ -253,62 +341,86 @@ footer{{text-align:center;padding:16px;color:#1e2433;font-size:11px}}
   <span class="ts">{now} UTC &nbsp;·&nbsp; auto-refresh {refresh}s</span>
 </header>
 
-<div class="status-grid">
-{status_lights}
+<div class="tabs">
+  <button class="tab-btn" data-tab="status">Status</button>
+  <button class="tab-btn" data-tab="portfolio">Portfolio</button>
 </div>
 
-<div class="cards">
-  <div class="card">
-    <div class="lbl">PnL Since 00:00 UTC</div>
-    <div class="val {day_pnl_cls}">{day_pnl}</div>
-    <div class="sub">Realised {realized_today} &nbsp;|&nbsp; MTM {mtm_today}</div>
-  </div>
-  <div class="card">
-    <div class="lbl">Account Value</div>
-    <div class="val neutral">{account_value}</div>
-    <div class="sub">Withdrawable {withdrawable}</div>
-  </div>
-  <div class="card">
-    <div class="lbl">Gross Exposure</div>
-    <div class="val neutral">{gross_exposure}</div>
-    <div class="sub">{gross_pct} of equity</div>
-  </div>
-  <div class="card">
-    <div class="lbl">Net Exposure</div>
-    <div class="val {net_cls}">{net_exposure}</div>
-    <div class="sub">{net_pct} of equity</div>
-  </div>
-  <div class="card">
-    <div class="lbl">Predicted Volatility</div>
-    <div class="val neutral">{port_vol}</div>
-    <div class="sub">Annualised · from latest intent</div>
+<div class="tab-panel" id="tab-status">
+  <div style="padding:20px 0 0">
+{status_content}
   </div>
 </div>
 
-<section>
-  <div class="sec-hdr">Positions ({n_rows})</div>
-  <table>
-    <thead>
-      <tr id="sort-header-positions">
-        <th data-col="0" data-type="str">Coin</th>
-        <th data-col="1" data-type="str">Direction</th>
-        <th data-col="2" data-type="num">Position Value</th>
-        <th data-col="3" data-type="num">Entry Price</th>
-        <th data-col="4" data-type="num">Mark Price</th>
-        <th data-col="5" data-type="num">PnL</th>
-        <th data-col="6" data-type="num">Value Traded Today</th>
-        <th data-col="7" data-type="num">PnL Today</th>
-      </tr>
-    </thead>
-    <tbody>
+<div class="tab-panel" id="tab-portfolio">
+  <div class="cards">
+    <div class="card">
+      <div class="lbl">PnL Since 00:00 UTC</div>
+      <div class="val {day_pnl_cls}">{day_pnl}</div>
+      <div class="sub">Realised {realized_today} &nbsp;|&nbsp; MTM {mtm_today}</div>
+    </div>
+    <div class="card">
+      <div class="lbl">Account Value</div>
+      <div class="val neutral">{account_value}</div>
+      <div class="sub">Withdrawable {withdrawable}</div>
+    </div>
+    <div class="card">
+      <div class="lbl">Gross Exposure</div>
+      <div class="val neutral">{gross_exposure}</div>
+      <div class="sub">{gross_pct} of equity</div>
+    </div>
+    <div class="card">
+      <div class="lbl">Net Exposure</div>
+      <div class="val {net_cls}">{net_exposure}</div>
+      <div class="sub">{net_pct} of equity</div>
+    </div>
+    <div class="card">
+      <div class="lbl">Predicted Volatility</div>
+      <div class="val neutral">{port_vol}</div>
+      <div class="sub">Annualised · from latest intent</div>
+    </div>
+  </div>
+
+  <section>
+    <div class="sec-hdr">Positions ({n_rows})</div>
+    <table>
+      <thead>
+        <tr id="sort-header-positions">
+          <th data-col="0" data-type="str">Coin</th>
+          <th data-col="1" data-type="str">Direction</th>
+          <th data-col="2" data-type="num">Position Value</th>
+          <th data-col="3" data-type="num">Entry Price</th>
+          <th data-col="4" data-type="num">Mark Price</th>
+          <th data-col="5" data-type="num">PnL</th>
+          <th data-col="6" data-type="num">Value Traded Today</th>
+          <th data-col="7" data-type="num">PnL Today</th>
+        </tr>
+      </thead>
+      <tbody>
 {positions_rows}
-    </tbody>
-  </table>
-</section>
+      </tbody>
+    </table>
+  </section>
+</div>
 
 <footer>exchange state &nbsp;·&nbsp; fills.jsonl &nbsp;·&nbsp; ohlcv_data.duckdb &nbsp;·&nbsp; mids.csv</footer>
 <script>
 (function(){{
+  var TAB_KEY = 'active_tab';
+  function showTab(name) {{
+    document.querySelectorAll('.tab-btn').forEach(function(b){{
+      b.classList.toggle('active', b.dataset.tab === name);
+    }});
+    document.querySelectorAll('.tab-panel').forEach(function(p){{
+      p.classList.toggle('active', p.id === 'tab-' + name);
+    }});
+    localStorage.setItem(TAB_KEY, name);
+  }}
+  document.querySelectorAll('.tab-btn').forEach(function(btn){{
+    btn.addEventListener('click', function(){{ showTab(btn.dataset.tab); }});
+  }});
+  showTab(localStorage.getItem(TAB_KEY) || 'status');
+
   function applySort(hdr, state) {{
     if (state.col === null) return;
     var th = hdr.querySelector('th[data-col="' + state.col + '"]');
@@ -362,35 +474,82 @@ def _fmt_ms(ms):
     return dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def build_status_lights(now, state):
-    data_stale   = _is_data_due(now, state)
-    intent_stale = _is_intent_due(now, state)
-    exec_stale   = _is_exec_due(now, state)
-    fills_stale  = _is_fills_stale(now, state)
+def _positions_match_str(state):
+    v = state.get("positions_match_exchange")
+    if v is None:
+        return "Unknown"
+    return "Match" if v else "Mismatch"
+
+
+def _positions_match_red(state):
+    v = state.get("positions_match_exchange")
+    return v is not True  # red if mismatch or never checked
+
+
+def _scard(lbl, val, sub, is_red):
+    dot_cls = "dot-red" if is_red else "dot-green"
+    return (
+        f'<div class="scard">'
+        f'<div class="dot {dot_cls}"></div>'
+        f'<div class="scard-body">'
+        f'<div class="scard-lbl">{lbl}</div>'
+        f'<div class="scard-val">{val}</div>'
+        f'<div class="scard-sub">{sub}</div>'
+        f'</div></div>'
+    )
+
+
+def build_status_tab(now, state):
+    data_stale    = _is_data_due(now, state)
+    intent_stale  = _is_intent_due(now, state)
+    exec_stale    = _is_exec_due(now, state)
+    fills_stale   = _is_fills_stale(now, state)
+    mkt_cap_stale = _is_mkt_cap_due(now, state)
 
     run_id = state.get("last_trading_intent_run_id") or "—"
     run_id_display = run_id.split("_")[0] if "_" in run_id else run_id
 
-    items = [
-        ("Data Updated",     _fmt_ms(state.get("last_data_run_ms")),      f"Due after {DATA_HOUR_UTC:02d}:{DATA_MINUTE_UTC:02d} UTC daily",          data_stale),
-        ("Trading Intent",   run_id_display,                               f"Due after {TRADING_INTENT_HOUR_UTC:02d}:{TRADING_INTENT_MINUTE_UTC:02d} UTC daily", intent_stale),
-        ("Last Execution",   _fmt_ms(state.get("last_trading_exec_ms")),   f"Every {TRADING_EXEC_INTERVAL_MINUTES}min after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC", exec_stale),
-        ("Fills Logged At",  _fmt_ms(state.get("fills_logged_at_ms")),     f"Every {POSITION_CHECK_INTERVAL_HOURS}h",                                 fills_stale),
+    open_orders  = load_open_orders_count()
+    last_fill_ms = load_last_fill_ms()
+    heartbeat_ms = load_heartbeat_ms()
+    error_count  = load_error_count_24h()
+
+    heartbeat_stale = heartbeat_ms is None or (now.timestamp() * 1000 - heartbeat_ms) > 5 * 60 * 1000
+    heartbeat_val = _fmt_ms(heartbeat_ms) if heartbeat_ms else "—"
+
+    # --- top health row ---
+    health_items = [
+        ("System Heartbeat", heartbeat_val,          "Loop silent > 5 min = red",                                               heartbeat_stale),
+        ("Positions Match",  _positions_match_str(state), f"Checked every {POSITION_CHECK_INTERVAL_HOURS}h · last {_fmt_ms(state.get('last_position_check_ms'))}", _positions_match_red(state)),
+        ("Errors (24h)",     str(error_count),        "ERROR-level log entries",                                                 error_count > 0),
     ]
 
-    cards = []
-    for lbl, val, sub, is_red in items:
-        dot_cls = "dot-red" if is_red else "dot-green"
-        cards.append(
-            f'<div class="scard">'
-            f'<div class="dot {dot_cls}"></div>'
-            f'<div class="scard-body">'
-            f'<div class="scard-lbl">{lbl}</div>'
-            f'<div class="scard-val">{val}</div>'
-            f'<div class="scard-sub">{sub}</div>'
-            f'</div></div>'
-        )
-    return "\n".join(cards)
+    # --- trading section ---
+    trading_items = [
+        ("Trading Intent",  run_id_display,                             f"Due after {TRADING_INTENT_HOUR_UTC:02d}:{TRADING_INTENT_MINUTE_UTC:02d} UTC daily", intent_stale),
+        ("Last Execution",  _fmt_ms(state.get("last_trading_exec_ms")), f"Every {TRADING_EXEC_INTERVAL_MINUTES}min after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC", exec_stale),
+        ("Last Fill",       _fmt_ms(last_fill_ms),                      "Most recent order filled",                                                last_fill_ms is None),
+        ("Open Orders",     str(open_orders),                           "From latest rebalance run",                                               open_orders > 10),
+        ("Fills Logged At", _fmt_ms(state.get("fills_logged_at_ms")),   f"Every {POSITION_CHECK_INTERVAL_HOURS}h",                                   fills_stale),
+    ]
+
+    # --- data section ---
+    data_items = [
+        ("OHLCV Updated", _fmt_ms(state.get("last_data_run_ms")),     f"Due after {DATA_HOUR_UTC:02d}:{DATA_MINUTE_UTC:02d} UTC daily",       data_stale),
+        ("Market Cap",    _fmt_ms(state.get("last_mkt_cap_run_ms")),  f"Due after {MKT_CAP_HOUR_UTC:02d}:{MKT_CAP_MINUTE_UTC:02d} UTC daily", mkt_cap_stale),
+    ]
+
+    def grid(items):
+        cards = "\n".join(_scard(*i) for i in items)
+        return f'<div class="status-grid">\n{cards}\n</div>'
+
+    return (
+        grid(health_items)
+        + '\n<div class="sec-hdr" style="padding:12px 24px 8px">Trading</div>\n'
+        + grid(trading_items)
+        + '\n<div class="sec-hdr" style="padding:12px 24px 8px">Data</div>\n'
+        + grid(data_items)
+    )
 
 
 def build_position_row(coin, pos, mids, today_value=None, today_pnl_val=None):
@@ -542,11 +701,11 @@ def build_page():
         ) or _EMPTY_8
     )
 
-    status_lights = build_status_lights(now, strategy_state)
+    status_content = build_status_tab(now, strategy_state)
 
     return PAGE.format(
         refresh=REFRESH_SECONDS,
-        status_lights=status_lights,
+        status_content=status_content,
         date=now.strftime("%Y-%m-%d"),
         now=now.strftime("%H:%M:%S"),
         day_pnl=fmt_usd(total_day_pnl),
