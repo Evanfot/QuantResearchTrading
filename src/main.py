@@ -236,6 +236,18 @@ def main():
     order_logger = OrderLogger(f"logs/orders_{TRADING_ENV}.jsonl")
 
     state = load_state(STATE_PATH)
+
+    # Bootstrap meta on first run so PositionRebuilder can load sz_decimals
+    if not state.get("last_meta_run_ms"):
+        try:
+            from scripts.meta_data import fetch_meta, store_meta
+            store_meta(fetch_meta())
+            state["last_meta_run_ms"] = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+            save_state(state, STATE_PATH)
+            logger.info("[meta] bootstrapped on first run")
+        except Exception:
+            logger.warning("[meta] bootstrap failed — fill logger may error until meta is available", exc_info=True)
+
     first_run = True
 
     while True:
@@ -244,6 +256,7 @@ def main():
         Path("state/heartbeat.ms").write_text(str(int(now.timestamp() * 1000)))
 
         if first_run:
+            logger.info(f"[startup] env={TRADING_ENV.upper()} | account={WALLET_ADDRESS}")
             logger.info(f"[startup] loop started at {now.isoformat()}")
             logger.info(
                 f"[startup] state loaded: last_data_run_ms={state.get('last_data_run_ms')}, "

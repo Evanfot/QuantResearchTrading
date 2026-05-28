@@ -4,9 +4,6 @@ from collections import defaultdict
 from typing import Dict, Any, Iterable
 
 
-from scripts.meta_data import read_latest_meta
-meta = read_latest_meta()
-sz_decimals = {coin['name']: coin['szDecimals'] for coin in meta['universe']}
 max_decimals = 6
 
 class PositionRebuilder:
@@ -17,6 +14,9 @@ class PositionRebuilder:
     """
 
     def __init__(self, open_positions=None):
+        from scripts.meta_data import read_latest_meta
+        meta = read_latest_meta()
+        self.sz_decimals = {coin['name']: coin['szDecimals'] for coin in meta['universe']}
         if open_positions is None:
             self.positions = defaultdict(self._empty_position)
         else:
@@ -40,7 +40,7 @@ class PositionRebuilder:
         coin = fill["coin"]
         fill_qty = float(fill["qty"])        # signed
         fill_price = float(fill["price"])
-        sz_decimals_coin = sz_decimals.get(coin, 0)
+        sz_decimals_coin = self.sz_decimals.get(coin, 0)
         if coin not in self.positions:
             self.positions[coin] = self._empty_position()
         # --- Case 1: No existing position ---

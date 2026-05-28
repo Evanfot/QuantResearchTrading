@@ -3,6 +3,7 @@
 
 # dotenv environment variables file
 .env
+.env.testnet
 logs/
 config.json
 *.log

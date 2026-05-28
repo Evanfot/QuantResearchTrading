@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
 
 load_dotenv()
-load_dotenv(".env.testnet", override=True)
 
 TRADING_ENV = os.getenv("TRADING_ENV", "mainnet").lower()
 

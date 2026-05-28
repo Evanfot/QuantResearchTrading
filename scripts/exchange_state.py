@@ -4,9 +4,9 @@ import requests
 from datetime import datetime,timezone
 from pathlib import Path
 
-from src.config import make_info, WALLET_ADDRESS
+from src.config import make_info, WALLET_ADDRESS, TRADING_ENV
 
-exchange_state_DIR = Path("data/hyperliquid_exchange_state")
+exchange_state_DIR = Path(f"data/hyperliquid_exchange_state_{TRADING_ENV}")
 exchange_state_DIR.mkdir(exist_ok=True)
 address = WALLET_ADDRESS
 
