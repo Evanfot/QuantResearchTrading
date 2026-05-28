@@ -27,6 +27,7 @@ def get_ohlcv(conn):
 
 def get_final_pricing(hyperliquid_prices, universe, latest_view):
     hype_universe = [k + "/USDC:USDC" for k in universe]
+    hype_universe = [s for s in hype_universe if s in hyperliquid_prices.columns]
     prices = hyperliquid_prices[hype_universe].copy(deep=True)
     prices.columns = prices.columns.str.replace("/USDC:USDC", "")
     available = [c for c in prices.columns if c in latest_view.index]
