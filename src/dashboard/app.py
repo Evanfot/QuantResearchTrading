@@ -91,7 +91,7 @@ def _is_fills_stale(now, state):
 def load_last_fill_ms():
     """Most recent fill_timestamp_ms from fills.jsonl, or None."""
     import json as _json
-    path = root / "logs/fills.jsonl"
+    path = root / f"logs/fills_{TRADING_ENV}.jsonl"
     if not path.exists():
         return None
     best = None
@@ -109,7 +109,7 @@ def load_last_fill_ms():
 def load_open_orders_count():
     """Count submitted orders from the most recent run_id that aren't filled."""
     import json as _json
-    path = root / "logs/orders.jsonl"
+    path = root / f"logs/orders_{TRADING_ENV}.jsonl"
     if not path.exists():
         return 0
     rows = []
