@@ -10,24 +10,32 @@ from src.positions.position_rebuilder import PositionRebuilder
 
 STATE_PATH = Path(f"state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json")
 
+def _setup_logging():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    err_handler = logging.FileHandler(f"logs/errors_{TRADING_ENV}.log")
+    err_handler.setLevel(logging.ERROR)
+    err_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(err_handler)
+
+
 def main():
     """Run one fill-logger poll cycle. Returns open_orders so the caller can loop."""
     exchange = "hyperliquid"
 
-    info = make_info()
-    fill_logger = FillLogger(f"logs/fills_{TRADING_ENV}.jsonl")
-
-    fill_run_id = dt.datetime.now(dt.timezone.utc).isoformat()
-    state = load_state(STATE_PATH)
-    last_ts = state["last_fill_timestamp_ms"]
-    state_positions = state["positions"]
-    assert state["exchange"] == 'hyperliquid'
-    assert state["schema_version"] == 1.2
-    if state.get("address") and state["address"] != WALLET_ADDRESS:
-        raise RuntimeError(f"State address mismatch: file has {state['address']}, expected {WALLET_ADDRESS}")
-    state["address"] = WALLET_ADDRESS
-
     try:
+        info = make_info()
+        fill_logger = FillLogger(f"logs/fills_{TRADING_ENV}.jsonl")
+
+        fill_run_id = dt.datetime.now(dt.timezone.utc).isoformat()
+        state = load_state(STATE_PATH)
+        last_ts = state["last_fill_timestamp_ms"]
+        state_positions = state["positions"]
+        assert state["exchange"] == 'hyperliquid'
+        assert state["schema_version"] == 1.2
+        if state.get("address") and state["address"] != WALLET_ADDRESS:
+            raise RuntimeError(f"State address mismatch: file has {state['address']}, expected {WALLET_ADDRESS}")
+        state["address"] = WALLET_ADDRESS
+
         raw_fills = info.user_fills_by_time(WALLET_ADDRESS, last_ts)
 
         fills_to_commit = []
@@ -67,7 +75,8 @@ def main():
             state["positions"] = positions
             save_state(state,STATE_PATH)
     except Exception as e:
-        logging.warning(f"[fill_logger] error: {e}")
+        logging.exception(f"[fill_logger] error: {e}")
+        return []
 
     return hl_open_orders(info, WALLET_ADDRESS)
 
@@ -94,4 +103,5 @@ if 0:
     # --- Result ---
 
 if __name__ == "__main__":
+    _setup_logging()
     main()
