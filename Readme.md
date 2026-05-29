@@ -21,6 +21,52 @@ This project is a way to keep my market knowledge and Python skills sharp. As an
 1. **Accessibility**: The APIs and data are open 24/7. This allows for continuous testing and iteration outside of traditional working hours without any conflict of interest with my professional role.
 2. **Technical Complexity**: Perpetuals are a relatively new financial instrument and have unique mechanics like funding rates and Auto-Deleveraging (ADL). This project enabled me to learn first-hand how these mechanics work in practice.
 
+## Testnet
+
+The system supports Hyperliquid testnet for testing execution code without risking real capital. A `TRADING_ENV` environment variable controls which network is active — all API calls, credentials, and state are automatically routed to the correct environment.
+
+### Setup
+
+1. Get a testnet account at [app.hyperliquid-testnet.xyz](https://app.hyperliquid-testnet.xyz) and fund it with test USDC from the faucet.
+2. Copy the credentials template and fill in your testnet wallet address, API wallet address, and private key:
+   ```
+   cp .env.testnet.example .env.testnet
+   ```
+3. State files are scoped by environment and wallet address (`state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json`), so mainnet and testnet state never collide even if you use the same wallet address on both networks.
+
+### Running locally
+
+```bash
+TRADING_ENV=testnet python -m src.main
+```
+
+### Running via Docker
+
+Testnet services are defined under the `testnet` profile and write logs to `./logs-testnet/` to keep them separate from mainnet logs.
+
+```bash
+# Start testnet trader only
+docker-compose --profile testnet up trader-testnet
+
+# Start both testnet trader and dashboard (available on port 8051)
+docker-compose --profile testnet up
+```
+
+The default `docker-compose up` (no profile) only starts mainnet services.
+
+### Manually triggering tasks
+
+Edit the state file (`state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json`) and restart.
+
+| To trigger | State field | Replace current value with |
+|---|---|---|
+| Trading intent | `last_trading_intent_run_id` | `""` |
+| Execution | `last_trading_exec_ms` | `0` |
+| OHLCV data download | `last_data_run_ms` | `0` |
+| Market cap update | `last_mkt_cap_run_ms` | `0` |
+| Position check | `last_position_check_ms` | `0` |
+| Exchange meta | `last_meta_run_ms` | `0` |
+
 ### Backtest output:
 - Generated 2026/05/09 using scripts.backtest
 - Output saved as ipynb in Examples

@@ -3,22 +3,15 @@ import json
 import requests
 from datetime import datetime,timezone
 from pathlib import Path
-import os
 
-from hyperliquid.info import Info
-from hyperliquid.utils.constants import MAINNET_API_URL
+from src.config import make_info, WALLET_ADDRESS, TRADING_ENV
 
-from dotenv import load_dotenv
-load_dotenv()
-
-WALLET_ADDRESS = os.getenv("HYPERLIQUID_WALLET_ADDRESS")
-
-exchange_state_DIR = Path("data/hyperliquid_exchange_state")
+exchange_state_DIR = Path(f"data/hyperliquid_exchange_state_{TRADING_ENV}")
 exchange_state_DIR.mkdir(exist_ok=True)
 address = WALLET_ADDRESS
 
 def fetch_exchange_state():
-    info = Info(MAINNET_API_URL, skip_ws=True)
+    info = make_info()
     exchange_state = info.user_state(address)
     return exchange_state
 

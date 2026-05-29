@@ -85,6 +85,8 @@ class IntentLogger:
             f.write(json.dumps(intent) + "\n")
 
     def read_latest(self):
-        with open("logs/intent.jsonl", "r") as f:
+        if not Path(self.path).exists():
+            return None
+        with open(self.path, "r") as f:
             latest_intent = json.loads(f.readlines()[-1])
         return latest_intent

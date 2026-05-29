@@ -12,6 +12,7 @@ DEFAULT_STATE = {
     "has_open_orders": False,
     "last_position_check_ms": 0,
     "fills_logged_at_ms": 0,
+    "last_meta_run_ms": 0,
     "positions": {},
 }
 

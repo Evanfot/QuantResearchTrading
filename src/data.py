@@ -27,11 +27,14 @@ def get_ohlcv(conn):
 
 def get_final_pricing(hyperliquid_prices, universe, latest_view):
     hype_universe = [k + "/USDC:USDC" for k in universe]
+    hype_universe = [s for s in hype_universe if s in hyperliquid_prices.columns]
     prices = hyperliquid_prices[hype_universe].copy(deep=True)
     prices.columns = prices.columns.str.replace("/USDC:USDC", "")
+    available = [c for c in prices.columns if c in latest_view.index]
+    prices = prices[available]
     prices.loc[
         dt.datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
-    ] = latest_view.loc[prices.columns.values, "mid"].astype("float")
+    ] = latest_view.loc[available, "mid"].astype("float")
     returns = np.log(prices).diff()
     returns_adj = (returns / returns.ewm(com=_VOLA_COM, min_periods=120).std()).clip(
         -_WINSOR, +_WINSOR

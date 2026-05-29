@@ -6,11 +6,13 @@ import requests
 from datetime import datetime,timezone
 from pathlib import Path
 
-META_DIR = Path("data/hyperliquid_meta")
+from src.config import HL_API_URL, TRADING_ENV
+
+META_DIR = Path(f"data/hyperliquid_meta_{TRADING_ENV}")
 META_DIR.mkdir(exist_ok=True)
 
 def fetch_meta():
-    url = "https://api.hyperliquid.xyz/info"
+    url = f"{HL_API_URL}/info"
     payload = {"type": "meta"}
     r = requests.post(url, json=payload, timeout=10)
     r.raise_for_status()

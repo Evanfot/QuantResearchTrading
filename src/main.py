@@ -23,6 +23,8 @@ DATA_HOUR_UTC = 0
 DATA_MINUTE_UTC = 1
 MKT_CAP_HOUR_UTC = 0
 MKT_CAP_MINUTE_UTC = 5
+META_HOUR_UTC = 23
+META_MINUTE_UTC = 45
 TRADING_EXEC_HOUR_UTC = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
 TRADING_INTENT_HOUR_UTC = 0
@@ -53,10 +55,31 @@ def is_position_check_due(now, state):
 
 
 def is_data_due(now, state):
-    if state.get("last_data_run_ms") is None:
+    last_ms = state.get("last_data_run_ms")
+    if last_ms:
+        last_run = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
+        return now.date() > last_run.date() and now.hour >= DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
+    # Fresh state (e.g. new testnet env) — query the DB for the latest row date before
+    # forcing a download. OHLCV data is market data shared across environments.
+    try:
+        db = Path("data/pricing/ohlcv_data.duckdb")
+        if db.exists():
+            conn = duckdb.connect(str(db), read_only=True)
+            max_date = conn.execute("SELECT MAX(datetime) FROM hyperliquid_1d").fetchone()[0]
+            conn.close()
+            if max_date and max_date.date() >= (now - dt.timedelta(days=1)).date():
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def is_meta_due(now, state):
+    last_ms = state.get("last_meta_run_ms")
+    if not last_ms:
         return True
-    last_run = dt.datetime.fromtimestamp(state["last_data_run_ms"] / 1000, tz=dt.timezone.utc)
-    return now.date() > last_run.date() and now.hour >= DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
+    last_run = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
+    return now.date() > last_run.date() and now.hour >= META_HOUR_UTC and now.minute >= META_MINUTE_UTC
 
 
 def is_mkt_cap_due(now, state):
@@ -69,7 +92,7 @@ def is_mkt_cap_due(now, state):
 
 def is_trading_intent_due(now, state):
     last_run_id = state.get("last_trading_intent_run_id")
-    if last_run_id is None:
+    if not last_run_id:
         return True
     ts_str = last_run_id.split("_")[0]
     last_run = dt.datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
@@ -109,6 +132,8 @@ def initialise_asset_intent(intent, universe):
 
 def add_ltp_to_intent(intent, latest_view):
     for symbol in intent["assets"].keys():
+        if symbol not in latest_view.index:
+            continue
         intent["assets"][symbol]["market"]["mark_price"] = float(latest_view.at[symbol, "mid"])
         intent["assets"][symbol]["market"]["data_timestamp"] = latest_view.loc[symbol, "downloaded_at"]
     return intent
@@ -184,11 +209,9 @@ def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_vi
 def main():
     import time
 
-    from dotenv import load_dotenv
     from eth_account import Account
     from hyperliquid.exchange import Exchange
-    from hyperliquid.info import Info
-    from hyperliquid.utils.constants import MAINNET_API_URL
+    from src.config import make_info, open_orders as hl_open_orders, HL_API_URL, PRIVATE_KEY, WALLET_ADDRESS, API_ADDRESS
     from scripts.exchange_state import read_latest_exchange_state, run_exchange_state
     from scripts.meta_data import get_hl_coins, read_latest_meta
     from scripts.run_fill_logger import main as run_fill_logger
@@ -201,25 +224,39 @@ def main():
     os.chdir(root)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    _err_handler = logging.FileHandler("logs/errors.log")
+    _err_handler.setLevel(logging.ERROR)
+    _err_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(_err_handler)
 
-    load_dotenv()
-    PRIVATE_KEY = os.getenv("HYPERLIQUID_PRIVATE_KEY")
-    WALLET_ADDRESS = os.getenv("HYPERLIQUID_WALLET_ADDRESS")
-    API_ADDRESS = os.getenv("HYPERLIQUID_API_WALLET_ADDRESS")
-    STATE_PATH = Path(f"state/hyperliquid_{WALLET_ADDRESS}_state.json")
+    from src.config import TRADING_ENV
+    STATE_PATH = Path(f"state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json")
 
-    intent_logger = IntentLogger("logs/intent.jsonl")
-    order_logger = OrderLogger("logs/orders.jsonl")
+    intent_logger = IntentLogger(f"logs/intent_{TRADING_ENV}.jsonl")
+    order_logger = OrderLogger(f"logs/orders_{TRADING_ENV}.jsonl")
 
     state = load_state(STATE_PATH)
+
+    # Bootstrap meta on first run so PositionRebuilder can load sz_decimals
+    if not state.get("last_meta_run_ms"):
+        try:
+            from scripts.meta_data import fetch_meta, store_meta
+            store_meta(fetch_meta())
+            state["last_meta_run_ms"] = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+            save_state(state, STATE_PATH)
+            logger.info("[meta] bootstrapped on first run")
+        except Exception:
+            logger.warning("[meta] bootstrap failed — fill logger may error until meta is available", exc_info=True)
+
     first_run = True
 
     while True:
         now = dt.datetime.now(dt.timezone.utc)
         run_id = generate_run_id()
+        Path("state/heartbeat.ms").write_text(str(int(now.timestamp() * 1000)))
 
         if first_run:
-            logger.setLevel(logging.INFO)
+            logger.info(f"[startup] env={TRADING_ENV.upper()} | account={WALLET_ADDRESS}")
             logger.info(f"[startup] loop started at {now.isoformat()}")
             logger.info(
                 f"[startup] state loaded: last_data_run_ms={state.get('last_data_run_ms')}, "
@@ -233,32 +270,27 @@ def main():
         if is_day_open_due(now, state):
             try:
                 from src.ingestion.update_mids import get_all_ltps
-                from hyperliquid.info import Info
-                from hyperliquid.utils.constants import MAINNET_API_URL
-                _info = Info(MAINNET_API_URL, skip_ws=True)
+                _info = make_info()
                 _day_open = get_all_ltps(_info)
                 _day_open.to_csv("data/snapshots/day_open.csv", index=False)
                 state["last_day_open_ms"] = int(now.timestamp() * 1000)
                 save_state(state, STATE_PATH)
                 logger.info("[day_open] snapshot saved")
             except Exception:
-                logger.warning("[day_open] failed to save snapshot")
+                logger.warning("[day_open] failed to save snapshot", exc_info=True)
 
         # ── Fill logger ────────────────────────────────────────────────────────
         if state.get("has_open_orders", False):
-            logger.info("[fill_logger] open orders detected, polling fills")
             open_orders = run_fill_logger()
             state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
-            logger.info(f"[fill_logger] done, open_orders remaining: {len(open_orders)}")
         elif first_run:
             logger.info("[fill_logger] no open orders, skipping tick poll")
 
         # ── Position reconciliation (hourly) ───────────────────────────────────
         if is_position_check_due(now, state):
-            logger.info("[position_check] running hourly fill log + position reconciliation")
             open_orders = run_fill_logger()
             state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
@@ -273,10 +305,12 @@ def main():
                 diff = dict_diff(exchange_positions, state_positions)
                 if diff["changed"]:
                     logger.warning(f"Position mismatch — state vs exchange: {diff['changed']}")
+                    state["positions_match_exchange"] = False
                 else:
-                    logger.info(f"[position_check] {len(state_positions)} positions match exchange")
+                    state["positions_match_exchange"] = True
             except Exception:
                 logger.warning("Position check failed: could not reach exchange")
+                state["positions_match_exchange"] = None
             state["last_position_check_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
         elif first_run:
@@ -304,14 +338,28 @@ def main():
 
         # ── Market cap task (daily at 00:05 UTC) ───────────────────────────────
         if is_mkt_cap_due(now, state):
-            logger.info("[mkt_cap] fetching latest market cap data")
+            logger.debug("[mkt_cap] fetching latest market cap data")
             store_market_cap(get_top_marketcap(200))
             state["last_mkt_cap_run_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
-            logger.info("[mkt_cap] complete")
+            logger.debug("[mkt_cap] complete")
         elif first_run:
             last_ms = state.get("last_mkt_cap_run_ms", 0)
-            logger.info(f"[mkt_cap] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {MKT_CAP_HOUR_UTC:02d}:{MKT_CAP_MINUTE_UTC:02d} UTC)")
+            logger.debug(f"[mkt_cap] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {MKT_CAP_HOUR_UTC:02d}:{MKT_CAP_MINUTE_UTC:02d} UTC)")
+
+        # ── Exchange meta task (daily at 23:45 UTC) ───────────────────────────
+        if is_meta_due(now, state):
+            try:
+                from scripts.meta_data import fetch_meta, store_meta
+                store_meta(fetch_meta())
+                state["last_meta_run_ms"] = int(now.timestamp() * 1000)
+                save_state(state, STATE_PATH)
+                logger.info("[meta] snapshot saved")
+            except Exception:
+                logger.warning("[meta] failed to fetch exchange meta", exc_info=True)
+        elif first_run:
+            last_ms = state.get("last_meta_run_ms", 0)
+            logger.info(f"[meta] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {META_HOUR_UTC:02d}:{META_MINUTE_UTC:02d} UTC)")
 
         # ── Trading intent task (daily) ────────────────────────────────────────
         if is_trading_intent_due(now, state):
@@ -336,9 +384,11 @@ def main():
             ltps = update_ltps()
             latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
             prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
+            tradable = list(prices.columns)
+            symbol_index = {s: i for i, s in enumerate(tradable)}
 
-            intent["universe"]["tradable"] = universe
-            intent = initialise_asset_intent(intent, universe)
+            intent["universe"]["tradable"] = tradable
+            intent = initialise_asset_intent(intent, tradable)
             intent["portfolio"]["equity_usd"] = float(exchange_state["marginSummary"]["accountValue"])
             intent["portfolio"]["equity_used_for_sizing"] = float(exchange_state["marginSummary"]["accountValue"])
             intent["portfolio"]["maintenance_margin"] = exchange_state["crossMaintenanceMarginUsed"]
@@ -365,7 +415,7 @@ def main():
             vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
             cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
 
-            for symbol in universe:
+            for symbol in tradable:
                 intent["assets"][symbol]["model"]["vol_1d"] = float(vo[-1, symbol_index[symbol]])
                 intent["assets"][symbol]["model"]["signal"] = {
                     "mu": float(mu[-1, symbol_index[symbol]]),
@@ -393,11 +443,17 @@ def main():
             logger.info("[exec] running execution plan")
             meta = read_latest_meta()
             sz_decimals = {coin["name"]: coin["szDecimals"] for coin in meta["universe"]}
-            info = Info(MAINNET_API_URL, skip_ws=True)
+            info = make_info()
             wallet = Account.from_key(PRIVATE_KEY)
-            ex = Exchange(wallet=wallet, base_url=MAINNET_API_URL, account_address=API_ADDRESS)
+            spot_meta = {"universe": [], "tokens": []} if TRADING_ENV == "testnet" else None
+            ex = Exchange(wallet=wallet, base_url=HL_API_URL, account_address=API_ADDRESS, spot_meta=spot_meta)
 
             intent_from_file = intent_logger.read_latest()
+            if not intent_from_file:
+                logger.warning("[exec] no intent file found, skipping execution until next intent run")
+                state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
+                save_state(state, STATE_PATH)
+                continue
             order_intentions = {
                 asset: intent_from_file["assets"][asset]["order_intent"]
                 for asset in intent_from_file["assets"]
@@ -415,12 +471,12 @@ def main():
                 positions = get_state_positions(state)
 
             if not DRY_RUN:
-                open_orders = info.open_orders(WALLET_ADDRESS)
+                open_orders = hl_open_orders(info, WALLET_ADDRESS)
                 if open_orders:
                     cancels = [{"coin": o["coin"], "oid": o["oid"]} for o in open_orders]
-                    logger.info(f"Cancel Requests: {cancels}")
+                    logger.debug(f"Cancel Requests: {cancels}")
                     resp = ex.bulk_cancel(cancels)
-                    logger.info(f"Cancel Response: {resp}")
+                    logger.debug(f"Cancel Response: {resp}")
 
             orders = get_execution_plan(order_intentions, ltps, sz_decimals, logger, positions=positions)
 
@@ -442,7 +498,7 @@ def main():
                             qty=order_info["sz"],
                             response={"response": {"data": {"statuses": [status]}}},
                         )
-                    logging.info("Rebalancing complete.")
+                    logging.info(f"[exec] Rebalance triggered — {len(orders)} orders submitted")
                 else:
                     print(f"Bulk submission failed: {response}")
 
@@ -452,15 +508,12 @@ def main():
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
-            logger.info(f"[exec] complete, orders placed: {len(orders) if orders else 0}")
         elif first_run:
             last_ms = state.get("last_trading_exec_ms", 0)
             next_due = dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc) + dt.timedelta(minutes=TRADING_EXEC_INTERVAL_MINUTES)
-            logger.info(f"[exec] not due (last: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, next: {next_due.isoformat()}, gate: after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC)")
+            logger.debug(f"[exec] not due (last: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, next: {next_due.isoformat()}, gate: after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC)")
 
         if first_run:
-            logger.info("[startup] first iteration complete, switching to ERROR-only logging")
-            logger.setLevel(logging.ERROR)
             first_run = False
 
         sleep_until_next_tick(state)
