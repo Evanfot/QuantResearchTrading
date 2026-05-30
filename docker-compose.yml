@@ -7,10 +7,15 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      BINANCE_DATA_ROOT: /app/klines
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
       - ./data:/app/data
+      - binance-klines:/app/klines
+    networks:
+      - binance-net
     command: python -m src.main
 
   dashboard:
@@ -21,13 +26,35 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      BINANCE_DATA_ROOT: /app/klines
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
       - ./data:/app/data
+      - binance-klines:/app/klines
+    networks:
+      - binance-net
     ports:
       - "8050:8050"
     command: python -m src.dashboard.app
+
+  cache-builder:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: cache-builder
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BINANCE_DATA_ROOT: /app/klines
+    volumes:
+      - ./data:/app/data
+      - binance-klines:/app/klines
+    networks:
+      - binance-net
+    command: python scripts/build_daily_cache.py
 
   trader-testnet:
     profiles: [testnet]
@@ -39,10 +66,15 @@ services:
     env_file:
       - .env
       - .env.testnet
+    environment:
+      BINANCE_DATA_ROOT: /app/klines
     volumes:
       - ./logs-testnet:/app/logs
       - ./state:/app/state
       - ./data:/app/data
+      - binance-klines:/app/klines
+    networks:
+      - binance-net
     command: python -m src.main
 
   dashboard-testnet:
@@ -55,10 +87,23 @@ services:
     env_file:
       - .env
       - .env.testnet
+    environment:
+      BINANCE_DATA_ROOT: /app/klines
     volumes:
       - ./logs-testnet:/app/logs
       - ./state:/app/state
       - ./data:/app/data
+      - binance-klines:/app/klines
+    networks:
+      - binance-net
     ports:
       - "8051:8050"
     command: python -m src.dashboard.app
+
+volumes:
+  binance-klines:
+    external: true
+
+networks:
+  binance-net:
+    external: true

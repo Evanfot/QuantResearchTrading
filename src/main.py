@@ -307,8 +307,10 @@ def main():
             logger.info(f"[position_check] not due, next at {next_due.isoformat()}")
 
         # ── Data task (daily at 00:01 UTC) ─────────────────────────────────────
+        # Fetches HL prices for symbols not covered by Binance, then combines
+        # with the Binance daily cache (built by the cache-builder service).
         if is_data_due(now, state):
-            logger.info("[data] downloading OHLCV data")
+            logger.info("[data] refreshing HL prices and building combined OHLCV cache")
             open_orders = run_fill_logger()
             state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
@@ -316,7 +318,8 @@ def main():
             save_state(state, STATE_PATH)
             run_ohlcv_dl()
             update_daily()
-            update_latest_view()
+            from scripts.build_daily_cache import build as _build_daily_cache
+            _build_daily_cache()
             state["last_data_run_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
             logger.info("[data] complete")

@@ -106,14 +106,6 @@ def load_last_fill_ms():
     return best
 
 
-def load_open_orders_count():
-    """Count live open orders from the exchange."""
-    try:
-        from src.config import make_info, open_orders, WALLET_ADDRESS
-        info = make_info()
-        return len(open_orders(info, WALLET_ADDRESS))
-    except Exception:
-        return 0
 
 
 def load_heartbeat_ms():
@@ -497,7 +489,7 @@ def build_status_tab(now, state):
     run_id = state.get("last_trading_intent_run_id") or "—"
     run_id_display = run_id.split("_")[0] if "_" in run_id else run_id
 
-    open_orders  = load_open_orders_count()
+    has_open_orders = state.get("has_open_orders", False)
     last_fill_ms = load_last_fill_ms()
     heartbeat_ms = load_heartbeat_ms()
     error_count  = load_error_count_24h()
@@ -517,7 +509,7 @@ def build_status_tab(now, state):
         ("Trading Intent",  run_id_display,                             f"Due after {TRADING_INTENT_HOUR_UTC:02d}:{TRADING_INTENT_MINUTE_UTC:02d} UTC daily", intent_stale),
         ("Last Execution",  _fmt_ms(state.get("last_trading_exec_ms")), f"Every {TRADING_EXEC_INTERVAL_MINUTES}min after {TRADING_EXEC_HOUR_UTC:02d}:00 UTC", exec_stale),
         ("Last Fill",       _fmt_ms(last_fill_ms),                      "Most recent order filled",                                                last_fill_ms is None),
-        ("Open Orders",     str(open_orders),                           "From latest rebalance run",                                               open_orders > 10),
+        ("Open Orders",     "Yes" if has_open_orders else "No",          "From last execution loop",                                                has_open_orders),
         ("Fills Logged At", _fmt_ms(state.get("fills_logged_at_ms")),   f"Every {POSITION_CHECK_INTERVAL_HOURS}h",                                   fills_stale),
     ]
 
