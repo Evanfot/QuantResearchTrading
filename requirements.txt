@@ -7,7 +7,7 @@ appnope==0.1.4
 asttokens==3.0.0
 attrs==25.3.0
 bitarray==3.8.0
-ccxt==4.5.25
+ccxt==4.5.56
 certifi==2025.8.3
 cffi==1.17.1
 charset-normalizer==3.4.3
