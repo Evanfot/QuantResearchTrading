@@ -257,3 +257,4 @@ __pycache__/
 # Optional: virtual env
 .venv/
 venv/
+scripts/sync_cache.sh

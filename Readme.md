@@ -67,6 +67,17 @@ Edit the state file (`state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.jso
 | Position check | `last_position_check_ms` | `0` |
 | Exchange meta | `last_meta_run_ms` | `0` |
 
+### Running backtests locally
+
+Backtests read from `data/cache/daily_ohlcv.parquet`, which is built nightly on the server by the `cache-builder` service. To get the latest data on your laptop before running a backtest:
+
+```bash
+# Copy scripts/sync_cache.sh.example → scripts/sync_cache.sh, fill in your server details
+scripts/sync_cache.sh
+```
+
+`sync_cache.sh` is gitignored (contains your server address). The `.example` file documents the required format.
+
 ### Backtest output:
 - Generated 2026/05/09 using scripts.backtest
 - Output saved as ipynb in Examples
