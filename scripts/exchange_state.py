@@ -1,8 +1,11 @@
 # TODO: Abstract this as it's the same flow as meta_data
 import json
+import logging
 import requests
 from datetime import datetime,timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from src.config import make_info, WALLET_ADDRESS, TRADING_ENV
 
@@ -40,7 +43,7 @@ def get_hl_coins():
 def run_exchange_state():
     exchange_state = fetch_exchange_state()
     path = store_exchange_state(exchange_state)
-    print(f"Saved exchange_state snapshot → {path}")
+    logger.info(f"Saved exchange_state snapshot → {path}")
     return exchange_state
 
 if __name__ == "__main__":
