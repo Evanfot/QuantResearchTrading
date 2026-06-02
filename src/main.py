@@ -1,6 +1,7 @@
 import datetime as dt
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict
 
@@ -112,6 +113,20 @@ def is_trading_exec_due(now, state):
 def sleep_until_next_tick(state):
     import time
     time.sleep(1)
+
+
+def _watchdog(threshold_s=600):
+    import time
+    while True:
+        time.sleep(60)
+        try:
+            ts_ms = float(Path("state/heartbeat.ms").read_text())
+            age = time.time() - ts_ms / 1000
+            if age > threshold_s:
+                logger.error(f"[watchdog] heartbeat stale for {age:.0f}s — forcing exit")
+                os._exit(1)
+        except Exception:
+            pass
 
 
 # ── Live-trading helpers ───────────────────────────────────────────────────────
@@ -247,21 +262,6 @@ def main():
             logger.info("[meta] bootstrapped on first run")
         except Exception:
             logger.warning("[meta] bootstrap failed — fill logger may error until meta is available", exc_info=True)
-
-    import threading
-
-    def _watchdog(threshold_s=600):
-        import time
-        while True:
-            time.sleep(60)
-            try:
-                ts_ms = float(Path("state/heartbeat.ms").read_text())
-                age = time.time() - ts_ms / 1000
-                if age > threshold_s:
-                    logger.error(f"[watchdog] heartbeat stale for {age:.0f}s — forcing exit")
-                    os._exit(1)
-            except Exception:
-                pass
 
     threading.Thread(target=_watchdog, daemon=True).start()
 
@@ -457,74 +457,79 @@ def main():
 
         # ── Execution task ─────────────────────────────────────────────────────
         if is_trading_exec_due(now, state):
-            logger.info("[exec] running execution plan")
-            meta = read_latest_meta()
-            sz_decimals = {coin["name"]: coin["szDecimals"] for coin in meta["universe"]}
-            info = make_info()
-            wallet = Account.from_key(PRIVATE_KEY)
-            spot_meta = {"universe": [], "tokens": []} if TRADING_ENV == "testnet" else None
-            ex = Exchange(wallet=wallet, base_url=HL_API_URL, account_address=API_ADDRESS, spot_meta=spot_meta)
+            try:
+                logger.info("[exec] running execution plan")
+                meta = read_latest_meta()
+                sz_decimals = {coin["name"]: coin["szDecimals"] for coin in meta["universe"]}
+                info = make_info()
+                wallet = Account.from_key(PRIVATE_KEY)
+                spot_meta = {"universe": [], "tokens": []} if TRADING_ENV == "testnet" else None
+                ex = Exchange(wallet=wallet, base_url=HL_API_URL, account_address=API_ADDRESS, spot_meta=spot_meta)
 
-            intent_from_file = intent_logger.read_latest()
-            if not intent_from_file:
-                logger.warning("[exec] no intent file found, skipping execution until next intent run")
+                intent_from_file = intent_logger.read_latest()
+                if not intent_from_file:
+                    logger.warning("[exec] no intent file found, skipping execution until next intent run")
+                    state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
+                    save_state(state, STATE_PATH)
+                    continue
+                order_intentions = {
+                    asset: intent_from_file["assets"][asset]["order_intent"]
+                    for asset in intent_from_file["assets"]
+                }
+
+                ltps = update_ltps()
+                try:
+                    exchange_state = run_exchange_state()
+                    positions = {
+                        row["position"]["coin"]: float(row["position"]["szi"])
+                        for row in exchange_state["assetPositions"]
+                    }
+                except Exception:
+                    logger.warning("can't fetch live positions for execution plan, falling back to state file")
+                    positions = get_state_positions(state)
+
+                if not DRY_RUN:
+                    open_orders = hl_open_orders(info, WALLET_ADDRESS)
+                    if open_orders:
+                        cancels = [{"coin": o["coin"], "oid": o["oid"]} for o in open_orders]
+                        logger.debug(f"Cancel Requests: {cancels}")
+                        resp = ex.bulk_cancel(cancels)
+                        logger.debug(f"Cancel Response: {resp}")
+
+                orders = get_execution_plan(order_intentions, ltps, sz_decimals, logger, positions=positions)
+
+                if not DRY_RUN and orders:
+                    print(generate_readable_summary(orders, ltps))
+                    response = ex.bulk_orders(orders)
+                    if response.get("status") == "ok":
+                        all_statuses = response["response"]["data"]["statuses"]
+                        for i, status in enumerate(all_statuses):
+                            order_info = orders[i]
+                            order_logger.log_order_submission(
+                                run_id=run_id,
+                                exchange="hyperliquid",
+                                account=WALLET_ADDRESS,
+                                symbol=order_info["coin"],
+                                side="buy" if order_info["is_buy"] else "sell",
+                                order_type="LIMIT",
+                                price=order_info["limit_px"],
+                                qty=order_info["sz"],
+                                response={"response": {"data": {"statuses": [status]}}},
+                            )
+                        logging.info(f"[exec] Rebalance triggered — {len(orders)} orders submitted")
+                    else:
+                        print(f"Bulk submission failed: {response}")
+
+                open_orders = run_fill_logger()
+                state = load_state(STATE_PATH)
+                state["has_open_orders"] = bool(open_orders)
+                state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
                 state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
                 save_state(state, STATE_PATH)
-                continue
-            order_intentions = {
-                asset: intent_from_file["assets"][asset]["order_intent"]
-                for asset in intent_from_file["assets"]
-            }
-
-            ltps = update_ltps()
-            try:
-                exchange_state = run_exchange_state()
-                positions = {
-                    row["position"]["coin"]: float(row["position"]["szi"])
-                    for row in exchange_state["assetPositions"]
-                }
             except Exception:
-                logger.warning("can't fetch live positions for execution plan, falling back to state file")
-                positions = get_state_positions(state)
-
-            if not DRY_RUN:
-                open_orders = hl_open_orders(info, WALLET_ADDRESS)
-                if open_orders:
-                    cancels = [{"coin": o["coin"], "oid": o["oid"]} for o in open_orders]
-                    logger.debug(f"Cancel Requests: {cancels}")
-                    resp = ex.bulk_cancel(cancels)
-                    logger.debug(f"Cancel Response: {resp}")
-
-            orders = get_execution_plan(order_intentions, ltps, sz_decimals, logger, positions=positions)
-
-            if not DRY_RUN and orders:
-                print(generate_readable_summary(orders, ltps))
-                response = ex.bulk_orders(orders)
-                if response.get("status") == "ok":
-                    all_statuses = response["response"]["data"]["statuses"]
-                    for i, status in enumerate(all_statuses):
-                        order_info = orders[i]
-                        order_logger.log_order_submission(
-                            run_id=run_id,
-                            exchange="hyperliquid",
-                            account=WALLET_ADDRESS,
-                            symbol=order_info["coin"],
-                            side="buy" if order_info["is_buy"] else "sell",
-                            order_type="LIMIT",
-                            price=order_info["limit_px"],
-                            qty=order_info["sz"],
-                            response={"response": {"data": {"statuses": [status]}}},
-                        )
-                    logging.info(f"[exec] Rebalance triggered — {len(orders)} orders submitted")
-                else:
-                    print(f"Bulk submission failed: {response}")
-
-            open_orders = run_fill_logger()
-            state = load_state(STATE_PATH)
-            state["has_open_orders"] = bool(open_orders)
-            state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
-            state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
-            save_state(state, STATE_PATH)
+                logger.warning("[exec] failed", exc_info=True)
+                state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
+                save_state(state, STATE_PATH)
         elif first_run:
             last_ms = state.get("last_trading_exec_ms", 0)
             next_due = dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc) + dt.timedelta(minutes=TRADING_EXEC_INTERVAL_MINUTES)
