@@ -248,6 +248,23 @@ def main():
         except Exception:
             logger.warning("[meta] bootstrap failed — fill logger may error until meta is available", exc_info=True)
 
+    import threading
+
+    def _watchdog(threshold_s=600):
+        import time
+        while True:
+            time.sleep(60)
+            try:
+                ts_ms = float(Path("state/heartbeat.ms").read_text())
+                age = time.time() - ts_ms / 1000
+                if age > threshold_s:
+                    logger.error(f"[watchdog] heartbeat stale for {age:.0f}s — forcing exit")
+                    os._exit(1)
+            except Exception:
+                pass
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
     first_run = True
 
     while True:
