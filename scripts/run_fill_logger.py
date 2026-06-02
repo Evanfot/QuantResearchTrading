@@ -74,11 +74,11 @@ def main():
             positions = rebuilder.rebuild_from_fills(fills)
             state["positions"] = positions
             save_state(state,STATE_PATH)
+
+        return hl_open_orders(info, WALLET_ADDRESS)
     except Exception as e:
         logging.exception(f"[fill_logger] error: {e}")
         return []
-
-    return hl_open_orders(info, WALLET_ADDRESS)
 
 
 if 0:
