@@ -115,7 +115,7 @@ def sleep_until_next_tick(state):
     time.sleep(1)
 
 
-def _watchdog(threshold_s=600):
+def _watchdog(threshold_s=1800):
     import time
     while True:
         time.sleep(60)
