@@ -123,18 +123,25 @@ async def fetch_symbol(symbol: str):
     since = get_start_time(symbol)
     end_ms = exchange.milliseconds()
     while since <= end_ms:
-        try:
-            ohlcv = await asyncio.to_thread(
-                exchange.fetch_ohlcv,
-                symbol,
-                timeframe=TIMEFRAME,
-                since=since,
-                limit=LIMIT
-            )
-        except Exception as e:
-            logger.warning(f"[data] {symbol} fetch error: {e}")
-            await asyncio.sleep(2)
-            continue
+        backoff = 5
+        for attempt in range(5):
+            try:
+                ohlcv = await asyncio.to_thread(
+                    exchange.fetch_ohlcv,
+                    symbol,
+                    timeframe=TIMEFRAME,
+                    since=since,
+                    limit=LIMIT
+                )
+                break
+            except Exception as e:
+                logger.warning(f"[data] {symbol} fetch error (attempt {attempt + 1}/5): {e}")
+                if attempt == 4:
+                    return f"[{symbol}] Giving up after 5 failed attempts"
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        else:
+            break
 
         if not ohlcv:
             break
@@ -156,9 +163,9 @@ async def fetch_symbol(symbol: str):
 
 async def dl(symbols=None):
     if symbols is None:
-        symbols = exchange.symbols
+        symbols = [s for s in exchange.symbols if s.endswith("/USDC:USDC")]
 
-    semaphore = asyncio.Semaphore(5)
+    semaphore = asyncio.Semaphore(2)
 
     async def sem_task(symbol):
         async with semaphore:
