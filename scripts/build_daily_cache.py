@@ -65,7 +65,10 @@ def _query_binance(store: HistoricalStore, since: pd.Timestamp | None = None) ->
         {where}
         GROUP BY 1, 2
         ORDER BY 1, 2
-    """).assign(symbol=lambda d: d["symbol"].map(to_hl)).dropna(subset=["symbol"])
+    """).assign(
+        symbol=lambda d: d["symbol"].map(to_hl),
+        date=lambda d: pd.to_datetime(d["date"]),
+    ).dropna(subset=["symbol"])
 
 
 def _build_hl(hl_only: set[str]) -> pd.DataFrame:
@@ -114,10 +117,19 @@ def build_binance() -> None:
     t = time.time()
     store = HistoricalStore()
 
+    since = None
     if BINANCE_CACHE_PATH.exists():
-        existing = pd.read_parquet(BINANCE_CACHE_PATH)
-        existing["date"] = pd.to_datetime(existing["date"])
-        since = existing["date"].max()
+        try:
+            existing = pd.read_parquet(BINANCE_CACHE_PATH)
+            existing["date"] = pd.to_datetime(existing["date"])
+            since = existing["date"].max()
+            if not (2020 <= since.year <= 2100):
+                raise ValueError(f"date out of expected range: {since}")
+        except Exception as e:
+            print(f"Binance: cache unreadable ({e}), falling back to full build …")
+            since = None
+
+    if since is not None:
         print(f"Binance: incremental from {since.date()} ({len(_binance_to_hl)} symbols) …")
         recent = _query_binance(store, since=since)
         df = (
