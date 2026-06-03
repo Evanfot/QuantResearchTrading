@@ -104,31 +104,30 @@ def _write_atomic(df: pd.DataFrame, path: Path) -> None:
         raise
 
 
-def build_binance(incremental: bool = False, lookback_days: int = 2) -> None:
+def build_binance() -> None:
     """Resample Binance 1m klines → binance_daily.parquet.
 
-    incremental=True resamples only the last `lookback_days` days and upserts
-    into the existing cache, which is much faster than a full rebuild.
-    Falls back to a full build if the cache doesn't exist yet.
+    If a cache already exists, resamples from the last cached date onward and
+    upserts — filling however many days are missing. Falls back to a full build
+    if no cache exists yet.
     """
     t = time.time()
     store = HistoricalStore()
 
-    if incremental and BINANCE_CACHE_PATH.exists():
-        since = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=lookback_days)
-        print(f"Binance: incremental resample from {since.date()} ({len(_binance_to_hl)} symbols) …")
-        recent = _query_binance(store, since=since)
+    if BINANCE_CACHE_PATH.exists():
         existing = pd.read_parquet(BINANCE_CACHE_PATH)
         existing["date"] = pd.to_datetime(existing["date"])
-        existing = existing[existing["date"] < since]
+        since = existing["date"].max()
+        print(f"Binance: incremental from {since.date()} ({len(_binance_to_hl)} symbols) …")
+        recent = _query_binance(store, since=since)
         df = (
-            pd.concat([existing, recent], ignore_index=True)
+            pd.concat([existing[existing["date"] < since], recent], ignore_index=True)
             .sort_values(["date", "symbol"])
             .reset_index(drop=True)
         )
-        print(f"  updated {recent['symbol'].nunique()} symbols, {len(recent):,} new rows")
+        print(f"  {recent['symbol'].nunique()} symbols, {len(recent):,} rows added/updated")
     else:
-        print(f"Binance: full resample ({len(_binance_to_hl)} symbols) …")
+        print(f"Binance: full build ({len(_binance_to_hl)} symbols) …")
         df = _query_binance(store)
         print(f"  {len(df):,} rows, {df['symbol'].nunique()} symbols")
 
@@ -190,7 +189,7 @@ def build_nightly() -> None:
         except Exception as e:
             errors.append(e)
 
-    t_binance = threading.Thread(target=_run, args=(lambda: build_binance(incremental=True),))
+    t_binance = threading.Thread(target=_run, args=(build_binance,))
     t_hl      = threading.Thread(target=_run, args=(_download_hl,))
     t_binance.start()
     t_hl.start()
@@ -249,7 +248,7 @@ if __name__ == "__main__":
         return (target - now).total_seconds()
 
     # Full Binance build on first launch (no existing cache), then HL, then combine
-    build_binance(incremental=False)
+    build_binance()
     _download_hl()
     build()
 
