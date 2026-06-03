@@ -5,12 +5,11 @@ import threading
 from pathlib import Path
 from typing import Any, Dict
 
-import duckdb
 import numpy as np
 import pandas as pd
 
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
-from src.data import db_path, get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
+from src.data import get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
 from src.execution import generate_readable_summary, get_execution_plan, get_order_intention
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
@@ -39,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 # ── Scheduling predicates ──────────────────────────────────────────────────────
 
+
+
 def is_day_open_due(now, state):
     last_ms = state.get("last_day_open_ms")
     if last_ms is None:
@@ -56,23 +57,10 @@ def is_position_check_due(now, state):
 
 
 def is_data_due(now, state):
-    last_ms = state.get("last_data_run_ms")
-    if last_ms:
-        last_run = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
-        return now.date() > last_run.date() and now.hour >= DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
-    # Fresh state (e.g. new testnet env) — query the DB for the latest row date before
-    # forcing a download. OHLCV data is market data shared across environments.
-    try:
-        db = Path("data/pricing/ohlcv_data.duckdb")
-        if db.exists():
-            conn = duckdb.connect(str(db), read_only=True)
-            max_date = conn.execute("SELECT MAX(datetime) FROM hyperliquid_1d").fetchone()[0]
-            conn.close()
-            if max_date and max_date.date() >= (now - dt.timedelta(days=1)).date():
-                return False
-    except Exception:
-        pass
-    return True
+    if state.get("last_data_run_ms") is None:
+        return True
+    last_run = dt.datetime.fromtimestamp(state["last_data_run_ms"] / 1000, tz=dt.timezone.utc)
+    return now.date() > last_run.date() and now.hour >= DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
 
 
 def is_meta_due(now, state):
@@ -230,7 +218,7 @@ def main():
     from scripts.exchange_state import read_latest_exchange_state, run_exchange_state
     from scripts.meta_data import get_hl_coins, read_latest_meta
     from scripts.run_fill_logger import main as run_fill_logger
-    from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily, update_latest_view
+    from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily
 
     # ── Setup ──────────────────────────────────────────────────────────────────
     root = Path().resolve()
@@ -336,16 +324,20 @@ def main():
             logger.info(f"[position_check] not due, next at {next_due.isoformat()}")
 
         # ── Data task (daily at 00:01 UTC) ─────────────────────────────────────
+        # Fetches HL prices for symbols not covered by Binance, then combines
+        # with the Binance daily cache (built by the cache-builder service).
         if is_data_due(now, state):
-            logger.info("[data] downloading OHLCV data")
+            logger.info("[data] refreshing HL prices and building combined OHLCV cache")
             open_orders = run_fill_logger()
             state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
-            run_ohlcv_dl()
-            update_daily()
-            update_latest_view()
+            if TRADING_ENV != "testnet":
+                run_ohlcv_dl()
+                update_daily()
+            from scripts.build_daily_cache import build as _build_daily_cache
+            _build_daily_cache()
             state["last_data_run_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
             logger.info("[data] complete")
@@ -396,16 +388,13 @@ def main():
             hl = get_hl_coins()
             universe, symbol_index = get_universe(top, hl, state.get("universe"))
 
-            conn = duckdb.connect(db_path)
-            hyperliquid_prices = get_ohlcv(conn)
+            prices_all = get_ohlcv()
             ltps = update_ltps()
             latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
-            prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
-            tradable = list(prices.columns)
-            symbol_index = {s: i for i, s in enumerate(tradable)}
+            prices, returns_adj = get_final_pricing(prices_all, universe, latest_view)
 
-            intent["universe"]["tradable"] = tradable
-            intent = initialise_asset_intent(intent, tradable)
+            intent["universe"]["tradable"] = universe
+            intent = initialise_asset_intent(intent, universe)
             intent["portfolio"]["equity_usd"] = float(exchange_state["marginSummary"]["accountValue"])
             intent["portfolio"]["equity_used_for_sizing"] = float(exchange_state["marginSummary"]["accountValue"])
             intent["portfolio"]["maintenance_margin"] = exchange_state["crossMaintenanceMarginUsed"]
@@ -432,7 +421,7 @@ def main():
             vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
             cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
 
-            for symbol in tradable:
+            for symbol in universe:
                 intent["assets"][symbol]["model"]["vol_1d"] = float(vo[-1, symbol_index[symbol]])
                 intent["assets"][symbol]["model"]["signal"] = {
                     "mu": float(mu[-1, symbol_index[symbol]]),
