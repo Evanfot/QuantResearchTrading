@@ -48,6 +48,8 @@ services:
     image: trend_trader:cache-builder
     container_name: cache-builder
     restart: unless-stopped
+    cpus: 1.5
+    mem_limit: 3g
     env_file:
       - .env
     environment:
