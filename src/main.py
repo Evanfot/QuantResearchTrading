@@ -218,7 +218,6 @@ def main():
     from scripts.exchange_state import read_latest_exchange_state, run_exchange_state
     from scripts.meta_data import get_hl_coins, read_latest_meta
     from scripts.run_fill_logger import main as run_fill_logger
-    from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily
 
     # ── Setup ──────────────────────────────────────────────────────────────────
     root = Path().resolve()
@@ -324,20 +323,19 @@ def main():
             logger.info(f"[position_check] not due, next at {next_due.isoformat()}")
 
         # ── Data task (daily at 00:01 UTC) ─────────────────────────────────────
-        # Fetches HL prices for symbols not covered by Binance, then combines
-        # with the Binance daily cache (built by the cache-builder service).
+        # Appends today's live mids to daily_ohlcv.parquet.
+        # Full historical build (Binance + HL) is done by cache-builder at 23:45 UTC.
         if is_data_due(now, state):
-            logger.info("[data] refreshing HL prices and building combined OHLCV cache")
+            logger.info("[data] appending today's mids to OHLCV cache")
             open_orders = run_fill_logger()
             state = load_state(STATE_PATH)
             state["has_open_orders"] = bool(open_orders)
             state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
-            if TRADING_ENV != "testnet":
-                run_ohlcv_dl()
-                update_daily()
-            from scripts.build_daily_cache import build as _build_daily_cache
-            _build_daily_cache()
+            from src.ingestion.update_mids import run_update_mids
+            run_update_mids()
+            from scripts.build_daily_cache import append_today_mids as _append_today_mids
+            _append_today_mids(Path("data/snapshots/mids.csv"))
             state["last_data_run_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
             logger.info("[data] complete")

@@ -1,16 +1,18 @@
 """
-Build the daily OHLCV cache in two phases:
+Build and maintain the daily OHLCV cache.
 
-  build_binance() — run by the cache-builder service on a nightly cron loop.
-    Resamples Binance 1m klines → daily and writes data/cache/binance_daily.parquet.
+cache-builder service (nightly at 23:45 UTC):
+  build_nightly() — runs Binance incremental resample and HL download in
+    parallel, then combines both into daily_ohlcv.parquet.
+  On first launch a full Binance history build is done before entering the loop.
 
-  build() — run by the trader data task after HL prices are refreshed.
-    Reads binance_daily.parquet and appends HL prices for symbols not covered
-    by Binance (XMR, HYPE, …). Writes data/cache/daily_ohlcv.parquet.
+trader data task (daily at 00:01 UTC):
+  append_today_mids() — upserts today's live mid prices into daily_ohlcv.parquet.
 """
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -47,7 +49,8 @@ def _hl_universe() -> set[str]:
         return {x["name"].upper() for x in json.load(f)["universe"]}
 
 
-def _build_binance(store: HistoricalStore) -> pd.DataFrame:
+def _query_binance(store: HistoricalStore, since: pd.Timestamp | None = None) -> pd.DataFrame:
+    where = f"WHERE open_time >= TIMESTAMP '{since.strftime('%Y-%m-%d')}'" if since else ""
     return store.query(f"""
         SELECT
             date_trunc('day', open_time)::DATE       AS date,
@@ -59,6 +62,7 @@ def _build_binance(store: HistoricalStore) -> pd.DataFrame:
             sum(volume)                              AS volume,
             sum(quote_volume)                        AS quote_volume
         FROM read_parquet([{_binance_globs()}], filename=true)
+        {where}
         GROUP BY 1, 2
         ORDER BY 1, 2
     """).assign(symbol=lambda d: d["symbol"].map(to_hl)).dropna(subset=["symbol"])
@@ -100,39 +104,66 @@ def _write_atomic(df: pd.DataFrame, path: Path) -> None:
         raise
 
 
-def build_binance() -> None:
-    """Resample Binance 1m klines → daily. Runs in the cache-builder service."""
+def build_binance(incremental: bool = False, lookback_days: int = 2) -> None:
+    """Resample Binance 1m klines → binance_daily.parquet.
+
+    incremental=True resamples only the last `lookback_days` days and upserts
+    into the existing cache, which is much faster than a full rebuild.
+    Falls back to a full build if the cache doesn't exist yet.
+    """
     t = time.time()
     store = HistoricalStore()
-    print(f"Binance: aggregating {len(_binance_to_hl)} symbols  1m → daily …")
-    df = _build_binance(store)
-    print(f"  {len(df):,} rows, {df['symbol'].nunique()} symbols")
+
+    if incremental and BINANCE_CACHE_PATH.exists():
+        since = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=lookback_days)
+        print(f"Binance: incremental resample from {since.date()} ({len(_binance_to_hl)} symbols) …")
+        recent = _query_binance(store, since=since)
+        existing = pd.read_parquet(BINANCE_CACHE_PATH)
+        existing["date"] = pd.to_datetime(existing["date"])
+        existing = existing[existing["date"] < since]
+        df = (
+            pd.concat([existing, recent], ignore_index=True)
+            .sort_values(["date", "symbol"])
+            .reset_index(drop=True)
+        )
+        print(f"  updated {recent['symbol'].nunique()} symbols, {len(recent):,} new rows")
+    else:
+        print(f"Binance: full resample ({len(_binance_to_hl)} symbols) …")
+        df = _query_binance(store)
+        print(f"  {len(df):,} rows, {df['symbol'].nunique()} symbols")
+
     _write_atomic(df, BINANCE_CACHE_PATH)
     print(f"Written → {BINANCE_CACHE_PATH}  ({time.time() - t:.1f}s)", flush=True)
 
 
+def _download_hl() -> None:
+    """Download HL 1h data via CCXT and resample to daily in ohlcv_data.duckdb."""
+    from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily
+    print("HL: downloading 1h data via CCXT …", flush=True)
+    run_ohlcv_dl()
+    update_daily()
+    print("HL: done", flush=True)
+
+
 def build() -> None:
-    """Combine Binance daily + HL fallback → daily_ohlcv.parquet. Runs in the trader."""
+    """Combine binance_daily.parquet + HL-only symbols → daily_ohlcv.parquet."""
     t = time.time()
 
-    # ── Binance ────────────────────────────────────────────────────────────────
     if BINANCE_CACHE_PATH.exists():
         binance_df = pd.read_parquet(BINANCE_CACHE_PATH)
         print(f"Binance: {binance_df['symbol'].nunique()} symbols (from cache)")
     else:
         store = HistoricalStore()
-        print(f"Binance: aggregating {len(_binance_to_hl)} symbols  1m → daily …")
-        binance_df = _build_binance(store)
+        print(f"Binance: full resample ({len(_binance_to_hl)} symbols) …")
+        binance_df = _query_binance(store)
         print(f"  {len(binance_df):,} rows, {binance_df['symbol'].nunique()} symbols")
 
-    # ── HL (fallback for uncovered symbols) ────────────────────────────────────
     hl_only = _hl_universe() - set(_hl_to_binance.keys())
     print(f"HL:      fetching {len(hl_only)} symbols from DuckDB …")
     hl_df = _build_hl(hl_only)
     n_hl = hl_df["symbol"].nunique() if not hl_df.empty else 0
     print(f"  {len(hl_df):,} rows, {n_hl} symbols")
 
-    # ── Merge & write ──────────────────────────────────────────────────────────
     df = (
         pd.concat([binance_df, hl_df], ignore_index=True)
         .assign(date=lambda d: pd.to_datetime(d["date"]))
@@ -149,20 +180,81 @@ def build() -> None:
     print(f"  elapsed:       {time.time() - t:.1f}s", flush=True)
 
 
+def build_nightly() -> None:
+    """Run Binance incremental resample and HL download in parallel, then combine."""
+    errors: list[Exception] = []
+
+    def _run(fn):
+        try:
+            fn()
+        except Exception as e:
+            errors.append(e)
+
+    t_binance = threading.Thread(target=_run, args=(lambda: build_binance(incremental=True),))
+    t_hl      = threading.Thread(target=_run, args=(_download_hl,))
+    t_binance.start()
+    t_hl.start()
+    t_binance.join()
+    t_hl.join()
+
+    if errors:
+        raise errors[0]
+
+    build()
+
+
+def append_today_mids(mids_csv: Path) -> None:
+    """Upsert today's live mid prices as the latest row in daily_ohlcv.parquet."""
+    if not CACHE_PATH.exists():
+        print("append_today_mids: cache not found, skipping", flush=True)
+        return
+    if not mids_csv.exists():
+        print("append_today_mids: mids.csv not found, skipping", flush=True)
+        return
+
+    mids = pd.read_csv(mids_csv, index_col="symbol")["mid"].astype(float)
+    today = pd.Timestamp.utcnow().normalize()
+
+    df = pd.read_parquet(CACHE_PATH)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[df["date"] < today]
+
+    rows = [
+        {
+            "date": today, "symbol": s,
+            "open": mids[s], "high": mids[s], "low": mids[s], "close": mids[s],
+            "volume": float("nan"), "quote_volume": float("nan"),
+        }
+        for s in df["symbol"].unique() if s in mids.index
+    ]
+    if rows:
+        df = (
+            pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+            .sort_values(["date", "symbol"])
+            .reset_index(drop=True)
+        )
+    _write_atomic(df, CACHE_PATH)
+    print(f"append_today_mids: {len(rows)} symbols → {today.date()}", flush=True)
+
+
 if __name__ == "__main__":
     import time as _time
     import datetime as _dt
 
     def _seconds_until_next_run() -> float:
         now = _dt.datetime.now(_dt.timezone.utc)
-        target = now.replace(hour=0, minute=1, second=0, microsecond=0)
+        target = now.replace(hour=23, minute=45, second=0, microsecond=0)
         if now >= target:
             target += _dt.timedelta(days=1)
         return (target - now).total_seconds()
 
-    build_binance()  # always build on startup so the cache is fresh from first launch
+    # Full Binance build on first launch (no existing cache), then HL, then combine
+    build_binance(incremental=False)
+    _download_hl()
+    build()
+
     while True:
         delay = _seconds_until_next_run()
-        print(f"[cache-builder] next build in {delay / 3600:.1f}h  (00:01 UTC)", flush=True)
+        print(f"[cache-builder] next build in {delay / 3600:.1f}h  (23:45 UTC)", flush=True)
         _time.sleep(delay)
-        build_binance()
+        build_nightly()
