@@ -54,6 +54,17 @@ docker-compose --profile testnet up
 
 The default `docker-compose up` (no profile) only starts mainnet services.
 
+### Docker command safety reference
+
+| Command | Safe? | Effect |
+|---|---|---|
+| `docker compose build trader-testnet` | ✅ | Rebuilds only testnet image |
+| `docker compose up -d trader-testnet` | ✅ | Uses existing testnet image |
+| `docker compose restart trader-testnet` | ✅ | No rebuild |
+| `docker compose build trader` | ⚠️ | Rebuilds mainnet image from current branch |
+| `docker compose build` | ❌ | Rebuilds all images |
+| `docker compose up --build` | ❌ | May rebuild services from current branch |
+
 ### Manually triggering tasks
 
 Edit the state file (`state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json`) and restart.

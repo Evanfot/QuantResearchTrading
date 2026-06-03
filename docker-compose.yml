@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    image: trend_trader:mainnet
     container_name: trader
     restart: unless-stopped
     env_file:
@@ -22,6 +23,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    image: trend_trader:mainnet
     container_name: dashboard
     restart: unless-stopped
     env_file:
@@ -43,6 +45,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    image: trend_trader:mainnet
     container_name: cache-builder
     restart: unless-stopped
     env_file:
@@ -61,6 +64,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    image: trend_trader:testnet
     container_name: trader-testnet
     restart: unless-stopped
     env_file:
@@ -82,6 +86,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    image: trend_trader:testnet
     container_name: dashboard-testnet
     restart: unless-stopped
     env_file:
