@@ -45,7 +45,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    image: trend_trader:mainnet
+    image: trend_trader:cache-builder
     container_name: cache-builder
     restart: unless-stopped
     env_file:
