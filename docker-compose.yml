@@ -9,7 +9,7 @@ services:
     env_file:
       - .env
     environment:
-      BINANCE_DATA_ROOT: /app/klines
+      BINANCE_DATA_ROOT: /app
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
@@ -29,7 +29,7 @@ services:
     env_file:
       - .env
     environment:
-      BINANCE_DATA_ROOT: /app/klines
+      BINANCE_DATA_ROOT: /app
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
@@ -51,7 +51,7 @@ services:
     env_file:
       - .env
     environment:
-      BINANCE_DATA_ROOT: /app/klines
+      BINANCE_DATA_ROOT: /app
     volumes:
       - ./data:/app/data
       - binance-klines:/app/klines
@@ -71,7 +71,7 @@ services:
       - .env
       - .env.testnet
     environment:
-      BINANCE_DATA_ROOT: /app/klines
+      BINANCE_DATA_ROOT: /app
     volumes:
       - ./logs-testnet:/app/logs
       - ./state:/app/state
@@ -93,7 +93,7 @@ services:
       - .env
       - .env.testnet
     environment:
-      BINANCE_DATA_ROOT: /app/klines
+      BINANCE_DATA_ROOT: /app
     volumes:
       - ./logs-testnet:/app/logs
       - ./state:/app/state
