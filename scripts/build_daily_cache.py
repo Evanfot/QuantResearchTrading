@@ -10,6 +10,7 @@ trader data task (daily at 00:01 UTC):
   append_today_mids() — upserts today's live mid prices into daily_ohlcv.parquet.
 """
 
+import concurrent.futures
 import json
 import sys
 import threading
@@ -47,28 +48,31 @@ def _query_binance(store: HistoricalStore, since: pd.Timestamp | None = None) ->
     symbols = sorted(_binance_to_hl.items())
     for i, (binance_sym, hl_sym) in enumerate(symbols, 1):
         path = HISTORICAL_DIR / binance_sym / INTERVAL / "*.parquet"
+        print(f"  [{i}/{len(symbols)}] {binance_sym} …", flush=True)
+        sql = f"""
+            SELECT
+                strftime(date_trunc('day', open_time), '%Y-%m-%d') AS date,
+                arg_min(open,  open_time) AS open,
+                max(high)                AS high,
+                min(low)                 AS low,
+                arg_max(close, open_time) AS close,
+                sum(volume)              AS volume,
+                sum(quote_volume)        AS quote_volume
+            FROM read_parquet('{path}')
+            {where}
+            GROUP BY 1
+            ORDER BY 1
+        """
         try:
-            df = store.query(f"""
-                SELECT
-                    strftime(date_trunc('day', open_time), '%Y-%m-%d') AS date,
-                    arg_min(open,  open_time) AS open,
-                    max(high)                AS high,
-                    min(low)                 AS low,
-                    arg_max(close, open_time) AS close,
-                    sum(volume)              AS volume,
-                    sum(quote_volume)        AS quote_volume
-                FROM read_parquet('{path}')
-                {where}
-                GROUP BY 1
-                ORDER BY 1
-            """)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(store.query, sql)
+                df = future.result(timeout=120)
             df["symbol"] = hl_sym
             dfs.append(df)
+        except concurrent.futures.TimeoutError:
+            print(f"  [{i}/{len(symbols)}] {binance_sym}: timed out after 120s, skipping", flush=True)
         except Exception as e:
             print(f"  [{i}/{len(symbols)}] {binance_sym}: skipped ({e})", flush=True)
-            continue
-        if i % 20 == 0:
-            print(f"  [{i}/{len(symbols)}] symbols processed …", flush=True)
 
     if not dfs:
         return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "quote_volume", "symbol"])
