@@ -33,15 +33,6 @@ CACHE_PATH         = ROOT / "data" / "cache" / "daily_ohlcv.parquet"
 BINANCE_CACHE_PATH = ROOT / "data" / "cache" / "binance_daily.parquet"
 HL_DB_PATH         = ROOT / "data" / "pricing" / "ohlcv_data.duckdb"
 
-_SYM_RE = r"/([A-Z0-9]+)/1m/"
-
-
-def _binance_globs() -> str:
-    return ", ".join(
-        f"'{HISTORICAL_DIR / b / INTERVAL / '*.parquet'}'" for b in sorted(_binance_to_hl)
-    )
-
-
 def _hl_universe() -> set[str]:
     meta_dir = ROOT / "data" / "hyperliquid_meta"
     latest = sorted(meta_dir.glob("meta_*.json"))[-1]
@@ -50,25 +41,41 @@ def _hl_universe() -> set[str]:
 
 
 def _query_binance(store: HistoricalStore, since: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Query one symbol at a time to keep memory footprint small."""
     where = f"WHERE open_time >= TIMESTAMP '{since.strftime('%Y-%m-%d')}'" if since else ""
-    return store.query(f"""
-        SELECT
-            strftime(date_trunc('day', open_time), '%Y-%m-%d') AS date,
-            regexp_extract(filename, '{_SYM_RE}', 1)            AS symbol,
-            arg_min(open,  open_time)                AS open,
-            max(high)                                AS high,
-            min(low)                                 AS low,
-            arg_max(close, open_time)                AS close,
-            sum(volume)                              AS volume,
-            sum(quote_volume)                        AS quote_volume
-        FROM read_parquet([{_binance_globs()}], filename=true)
-        {where}
-        GROUP BY 1, 2
-        ORDER BY 1, 2
-    """).assign(
-        symbol=lambda d: d["symbol"].map(to_hl),
-        date=lambda d: pd.to_datetime(d["date"]),
-    ).dropna(subset=["symbol"])
+    dfs = []
+    symbols = sorted(_binance_to_hl.items())
+    for i, (binance_sym, hl_sym) in enumerate(symbols, 1):
+        path = HISTORICAL_DIR / binance_sym / INTERVAL / "*.parquet"
+        try:
+            df = store.query(f"""
+                SELECT
+                    strftime(date_trunc('day', open_time), '%Y-%m-%d') AS date,
+                    arg_min(open,  open_time) AS open,
+                    max(high)                AS high,
+                    min(low)                 AS low,
+                    arg_max(close, open_time) AS close,
+                    sum(volume)              AS volume,
+                    sum(quote_volume)        AS quote_volume
+                FROM read_parquet('{path}')
+                {where}
+                GROUP BY 1
+                ORDER BY 1
+            """)
+            df["symbol"] = hl_sym
+            dfs.append(df)
+        except Exception as e:
+            print(f"  [{i}/{len(symbols)}] {binance_sym}: skipped ({e})", flush=True)
+            continue
+        if i % 20 == 0:
+            print(f"  [{i}/{len(symbols)}] symbols processed …", flush=True)
+
+    if not dfs:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "quote_volume", "symbol"])
+    return (
+        pd.concat(dfs, ignore_index=True)
+        .assign(date=lambda d: pd.to_datetime(d["date"]))
+    )
 
 
 def _build_hl(hl_only: set[str]) -> pd.DataFrame:
