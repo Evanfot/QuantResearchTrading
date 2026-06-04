@@ -179,6 +179,8 @@ def build() -> None:
         print(f"Binance: full resample ({len(_binance_to_hl)} symbols) …")
         binance_df = _query_binance(store)
         print(f"  {len(binance_df):,} rows, {binance_df['symbol'].nunique()} symbols")
+        _write_atomic(binance_df, BINANCE_CACHE_PATH)
+        print(f"Written → {BINANCE_CACHE_PATH}", flush=True)
 
     hl_only = _hl_universe() - set(_hl_to_binance.keys())
     print(f"HL:      fetching {len(hl_only)} symbols from DuckDB …")
