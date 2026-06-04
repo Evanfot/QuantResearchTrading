@@ -41,6 +41,16 @@ def _hl_universe() -> set[str]:
         return {x["name"].upper() for x in json.load(f)["universe"]}
 
 
+def _duck_query(sql: str) -> pd.DataFrame:
+    """Run a DuckDB query with an explicit close so memory is freed between symbols."""
+    con = duckdb.connect()
+    con.execute("SET memory_limit='1GB'")
+    try:
+        return con.execute(sql).df()
+    finally:
+        con.close()
+
+
 def _query_binance(store: HistoricalStore, since: pd.Timestamp | None = None) -> pd.DataFrame:
     """Query one symbol at a time to keep memory footprint small."""
     where = f"WHERE open_time >= TIMESTAMP '{since.strftime('%Y-%m-%d')}'" if since else ""
@@ -65,7 +75,7 @@ def _query_binance(store: HistoricalStore, since: pd.Timestamp | None = None) ->
         """
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(store.query, sql)
+                future = ex.submit(_duck_query, sql)
                 df = future.result(timeout=120)
             df["symbol"] = hl_sym
             dfs.append(df)
