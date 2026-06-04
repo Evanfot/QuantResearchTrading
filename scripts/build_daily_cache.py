@@ -53,8 +53,8 @@ def _query_binance(store: HistoricalStore, since: pd.Timestamp | None = None) ->
     where = f"WHERE open_time >= TIMESTAMP '{since.strftime('%Y-%m-%d')}'" if since else ""
     return store.query(f"""
         SELECT
-            date_trunc('day', open_time)::DATE       AS date,
-            regexp_extract(filename, '{_SYM_RE}', 1) AS symbol,
+            strftime(date_trunc('day', open_time), '%Y-%m-%d') AS date,
+            regexp_extract(filename, '{_SYM_RE}', 1)            AS symbol,
             arg_min(open,  open_time)                AS open,
             max(high)                                AS high,
             min(low)                                 AS low,
