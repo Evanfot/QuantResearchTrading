@@ -72,12 +72,12 @@ services:
       - .env
       - .env.testnet
     environment:
-      BINANCE_DATA_ROOT: /app
+      BINANCE_KLINES_DIR: /app/binance-klines
     volumes:
       - ./logs-testnet:/app/logs
       - ./state:/app/state
       - ./data:/app/data
-      - binance-klines:/app/klines
+      - ~/projects/binance-klines:/app/binance-klines:ro
     networks:
       - binance-net
     command: python -m src.main
@@ -94,12 +94,12 @@ services:
       - .env
       - .env.testnet
     environment:
-      BINANCE_DATA_ROOT: /app
+      BINANCE_KLINES_DIR: /app/binance-klines
     volumes:
       - ./logs-testnet:/app/logs
       - ./state:/app/state
       - ./data:/app/data
-      - binance-klines:/app/klines
+      - ~/projects/binance-klines:/app/binance-klines:ro
     networks:
       - binance-net
     ports:
