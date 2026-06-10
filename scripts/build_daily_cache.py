@@ -1,19 +1,20 @@
 """
 Build and maintain the daily OHLCV cache.
 
-cache-builder service (nightly at 23:45 UTC):
-  build_nightly() — runs Binance incremental resample and HL download in
-    parallel, then combines both into daily_ohlcv.parquet.
-  On first launch a full Binance history build is done before entering the loop.
+Binance data is provided by the external binance-klines project and written to
+  $BINANCE_KLINES_DIR/klines/processed/daily_closes.parquet  (available ~03:00 UTC).
 
-trader data task (daily at 00:01 UTC):
-  append_today_mids() — upserts today's live mid prices into daily_ohlcv.parquet.
+Nightly at 23:45 UTC (trader data task):
+  build() — downloads HL OHLCV, then reads daily_closes.parquet (Binance) +
+    HL DuckDB → daily_ohlcv.parquet.
+
+Today's live prices are NOT written to the parquet. They are appended in-memory
+at intent time via get_final_pricing() in src/main.py.
 """
 
-import concurrent.futures
 import json
+import os
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -26,13 +27,14 @@ load_dotenv()
 import duckdb
 import pandas as pd
 
-from config import HISTORICAL_DIR, INTERVAL
-from storage import HistoricalStore
-from symbol_map import _binance_to_hl, _hl_to_binance, to_hl
+CACHE_PATH = ROOT / "data" / "cache" / "daily_ohlcv.parquet"
+HL_DB_PATH = ROOT / "data" / "pricing" / "ohlcv_data.duckdb"
 
-CACHE_PATH         = ROOT / "data" / "cache" / "daily_ohlcv.parquet"
-BINANCE_CACHE_PATH = ROOT / "data" / "cache" / "binance_daily.parquet"
-HL_DB_PATH         = ROOT / "data" / "pricing" / "ohlcv_data.duckdb"
+_BINANCE_KLINES_DIR = Path(
+    os.environ.get("BINANCE_KLINES_DIR", "~/projects/binance-klines")
+).expanduser()
+_DAILY_CLOSES_PATH = _BINANCE_KLINES_DIR / "klines" / "processed" / "daily_closes.parquet"
+
 
 def _hl_universe() -> set[str]:
     meta_dir = ROOT / "data" / "hyperliquid_meta"
@@ -41,55 +43,28 @@ def _hl_universe() -> set[str]:
         return {x["name"].upper() for x in json.load(f)["universe"]}
 
 
-def _duck_query(sql: str) -> pd.DataFrame:
-    """Run a DuckDB query with an explicit close so memory is freed between symbols."""
-    con = duckdb.connect()
-    con.execute("SET memory_limit='1GB'")
-    try:
-        return con.execute(sql).df()
-    finally:
-        con.close()
+def _load_binance_closes() -> pd.DataFrame:
+    """Read daily_closes.parquet → long DataFrame with full OHLCV, HL-mapped symbol names."""
+    df = pd.read_parquet(_DAILY_CLOSES_PATH)
 
+    # Wide format: DatetimeIndex × symbol columns (no 'symbol' column)
+    if "symbol" not in df.columns:
+        df.index = pd.to_datetime(df.index)
+        df = (
+            df.rename_axis("date")
+              .reset_index()
+              .melt(id_vars="date", var_name="symbol", value_name="close")
+        )
+        for col in ("open", "high", "low"):
+            df[col] = df["close"]
+        df["volume"] = float("nan")
+        df["quote_volume"] = float("nan")
+    else:
+        df["date"] = pd.to_datetime(df["date"])
 
-def _query_binance(store: HistoricalStore, since: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Query one symbol at a time to keep memory footprint small."""
-    where = f"WHERE open_time >= TIMESTAMP '{since.strftime('%Y-%m-%d')}'" if since else ""
-    dfs = []
-    symbols = sorted(_binance_to_hl.items())
-    for i, (binance_sym, hl_sym) in enumerate(symbols, 1):
-        path = HISTORICAL_DIR / binance_sym / INTERVAL / "*.parquet"
-        print(f"  [{i}/{len(symbols)}] {binance_sym} …", flush=True)
-        sql = f"""
-            SELECT
-                strftime(date_trunc('day', open_time), '%Y-%m-%d') AS date,
-                arg_min(open,  open_time) AS open,
-                max(high)                AS high,
-                min(low)                 AS low,
-                arg_max(close, open_time) AS close,
-                sum(volume)              AS volume,
-                sum(quote_volume)        AS quote_volume
-            FROM read_parquet('{path}')
-            {where}
-            GROUP BY 1
-            ORDER BY 1
-        """
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(_duck_query, sql)
-                df = future.result(timeout=120)
-            df["symbol"] = hl_sym
-            dfs.append(df)
-        except concurrent.futures.TimeoutError:
-            print(f"  [{i}/{len(symbols)}] {binance_sym}: timed out after 120s, skipping", flush=True)
-        except Exception as e:
-            print(f"  [{i}/{len(symbols)}] {binance_sym}: skipped ({e})", flush=True)
-
-    if not dfs:
-        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "quote_volume", "symbol"])
-    return (
-        pd.concat(dfs, ignore_index=True)
-        .assign(date=lambda d: pd.to_datetime(d["date"]))
-    )
+    # Map Binance names (BTCUSDT) → HL names (BTC)
+    df["symbol"] = df["symbol"].str.replace(r"(USDT|BUSD)$", "", regex=True)
+    return df.dropna(subset=["symbol", "close"])
 
 
 def _build_hl(hl_only: set[str]) -> pd.DataFrame:
@@ -128,46 +103,6 @@ def _write_atomic(df: pd.DataFrame, path: Path) -> None:
         raise
 
 
-def build_binance() -> None:
-    """Resample Binance 1m klines → binance_daily.parquet.
-
-    If a cache already exists, resamples from the last cached date onward and
-    upserts — filling however many days are missing. Falls back to a full build
-    if no cache exists yet.
-    """
-    t = time.time()
-    store = HistoricalStore()
-
-    since = None
-    if BINANCE_CACHE_PATH.exists():
-        try:
-            existing = pd.read_parquet(BINANCE_CACHE_PATH)
-            existing["date"] = pd.to_datetime(existing["date"])
-            since = existing["date"].max()
-            if not (2020 <= since.year <= 2100):
-                raise ValueError(f"date out of expected range: {since}")
-        except Exception as e:
-            print(f"Binance: cache unreadable ({e}), falling back to full build …")
-            since = None
-
-    if since is not None:
-        print(f"Binance: incremental from {since.date()} ({len(_binance_to_hl)} symbols) …")
-        recent = _query_binance(store, since=since)
-        df = (
-            pd.concat([existing[existing["date"] < since], recent], ignore_index=True)
-            .sort_values(["date", "symbol"])
-            .reset_index(drop=True)
-        )
-        print(f"  {recent['symbol'].nunique()} symbols, {len(recent):,} rows added/updated")
-    else:
-        print(f"Binance: full build ({len(_binance_to_hl)} symbols) …")
-        df = _query_binance(store)
-        print(f"  {len(df):,} rows, {df['symbol'].nunique()} symbols")
-
-    _write_atomic(df, BINANCE_CACHE_PATH)
-    print(f"Written → {BINANCE_CACHE_PATH}  ({time.time() - t:.1f}s)", flush=True)
-
-
 def _download_hl() -> None:
     """Download HL 1h data via CCXT and resample to daily in ohlcv_data.duckdb."""
     from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily
@@ -178,26 +113,23 @@ def _download_hl() -> None:
 
 
 def build() -> None:
-    """Combine binance_daily.parquet + HL-only symbols → daily_ohlcv.parquet."""
+    """Read Binance daily_closes.parquet + HL-only symbols → daily_ohlcv.parquet."""
     t = time.time()
 
-    if BINANCE_CACHE_PATH.exists():
-        binance_df = pd.read_parquet(BINANCE_CACHE_PATH)
-        print(f"Binance: {binance_df['symbol'].nunique()} symbols (from cache)")
-    else:
-        store = HistoricalStore()
-        print(f"Binance: full resample ({len(_binance_to_hl)} symbols) …")
-        binance_df = _query_binance(store)
-        print(f"  {len(binance_df):,} rows, {binance_df['symbol'].nunique()} symbols")
-        _write_atomic(binance_df, BINANCE_CACHE_PATH)
-        print(f"Written → {BINANCE_CACHE_PATH}", flush=True)
+    # ── Binance ────────────────────────────────────────────────────────────────
+    print(f"Binance: reading from {_DAILY_CLOSES_PATH} …")
+    binance_df = _load_binance_closes()
+    binance_covered = set(binance_df["symbol"].unique())
+    print(f"  {len(binance_df):,} rows, {len(binance_covered)} symbols")
 
-    hl_only = _hl_universe() - set(_hl_to_binance.keys())
+    # ── HL fallback for coins not in Binance data ──────────────────────────────
+    hl_only = _hl_universe() - binance_covered
     print(f"HL:      fetching {len(hl_only)} symbols from DuckDB …")
     hl_df = _build_hl(hl_only)
     n_hl = hl_df["symbol"].nunique() if not hl_df.empty else 0
     print(f"  {len(hl_df):,} rows, {n_hl} symbols")
 
+    # ── Merge & write ──────────────────────────────────────────────────────────
     df = (
         pd.concat([binance_df, hl_df], ignore_index=True)
         .assign(date=lambda d: pd.to_datetime(d["date"]))
@@ -209,70 +141,12 @@ def build() -> None:
     print(f"\nWritten → {CACHE_PATH}")
     print(f"  total rows:    {len(df):,}")
     print(f"  total symbols: {df['symbol'].nunique()}  "
-          f"({binance_df['symbol'].nunique()} Binance + {n_hl} HL-only)")
+          f"({len(binance_covered)} Binance + {n_hl} HL-only)")
     print(f"  date range:    {df['date'].min().date()} → {df['date'].max().date()}")
     print(f"  elapsed:       {time.time() - t:.1f}s", flush=True)
 
 
-def build_nightly() -> None:
-    """Run Binance incremental resample and HL download in parallel, then combine."""
-    errors: list[Exception] = []
-
-    def _run(fn):
-        try:
-            fn()
-        except Exception as e:
-            errors.append(e)
-
-    t_binance = threading.Thread(target=_run, args=(build_binance,))
-    t_hl      = threading.Thread(target=_run, args=(_download_hl,))
-    t_binance.start()
-    t_hl.start()
-    t_binance.join()
-    t_hl.join()
-
-    if errors:
-        raise errors[0]
-
-    build()
-
-
-def append_today_mids(mids_csv: Path) -> None:
-    """Upsert today's live mid prices as the latest row in daily_ohlcv.parquet."""
-    if not CACHE_PATH.exists():
-        print("append_today_mids: cache not found, skipping", flush=True)
-        return
-    if not mids_csv.exists():
-        print("append_today_mids: mids.csv not found, skipping", flush=True)
-        return
-
-    mids = pd.read_csv(mids_csv, index_col="symbol")["mid"].astype(float)
-    today = pd.Timestamp.utcnow().normalize()
-
-    df = pd.read_parquet(CACHE_PATH)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df[df["date"] < today]
-
-    rows = [
-        {
-            "date": today, "symbol": s,
-            "open": mids[s], "high": mids[s], "low": mids[s], "close": mids[s],
-            "volume": float("nan"), "quote_volume": float("nan"),
-        }
-        for s in df["symbol"].unique() if s in mids.index
-    ]
-    if rows:
-        df = (
-            pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
-            .sort_values(["date", "symbol"])
-            .reset_index(drop=True)
-        )
-    _write_atomic(df, CACHE_PATH)
-    print(f"append_today_mids: {len(rows)} symbols → {today.date()}", flush=True)
-
-
 if __name__ == "__main__":
-    import time as _time
     import datetime as _dt
 
     def _seconds_until_next_run() -> float:
@@ -282,13 +156,12 @@ if __name__ == "__main__":
             target += _dt.timedelta(days=1)
         return (target - now).total_seconds()
 
-    # Full Binance build on first launch (no existing cache), then HL, then combine
-    build_binance()
     _download_hl()
     build()
 
     while True:
         delay = _seconds_until_next_run()
         print(f"[cache-builder] next build in {delay / 3600:.1f}h  (23:45 UTC)", flush=True)
-        _time.sleep(delay)
-        build_nightly()
+        time.sleep(delay)
+        _download_hl()
+        build()

@@ -1,7 +1,10 @@
 """Lightweight data-access utilities shared by analysis scripts and the live loop.
 
-OHLCV data comes from data/cache/daily_ohlcv.parquet, built nightly at 23:45 UTC
-by scripts/build_daily_cache.py (which reads the Binance 1m kline store).
+OHLCV data comes from data/cache/daily_ohlcv.parquet, rebuilt daily by
+scripts/build_daily_cache.build():
+  - Primary:  Binance daily closes from $BINANCE_KLINES_DIR/klines/processed/daily_closes.parquet
+  - Fallback: Hyperliquid DuckDB for coins not covered by Binance (XMR, HYPE, …)
+  - Today:    live HL mid prices appended via append_today_mids()
 """
 
 import datetime as dt
