@@ -18,12 +18,12 @@ from src.state.strategy_state import get_state_positions, load_state, save_state
 from src.universe import get_latest_market_cap, get_top_marketcap, get_universe, store_market_cap
 
 # ── Scheduling constants ───────────────────────────────────────────────────────
-DATA_HOUR_UTC = 0
-DATA_MINUTE_UTC = 1
+DATA_HOUR_UTC = 23
+DATA_MINUTE_UTC = 45
 MKT_CAP_HOUR_UTC = 0
 MKT_CAP_MINUTE_UTC = 5
 META_HOUR_UTC = 23
-META_MINUTE_UTC = 45
+META_MINUTE_UTC = 40
 TRADING_EXEC_HOUR_UTC = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
 TRADING_INTENT_HOUR_UTC = 0
@@ -306,16 +306,12 @@ def main():
             next_due = dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc) + dt.timedelta(hours=POSITION_CHECK_INTERVAL_HOURS)
             logger.info(f"[position_check] not due, next at {next_due.isoformat()}")
 
-        # ── Data task (daily at 00:01 UTC) ─────────────────────────────────────
-        # Fetches HL prices for symbols not covered by Binance, then combines
-        # with the Binance daily cache (built by the cache-builder service).
+        # ── Data task (nightly at 23:45 UTC) ──────────────────────────────────
+        # 1. Download HL OHLCV (for coins not in Binance data); skipped on testnet.
+        # 2. build() reads daily_closes.parquet (Binance) + HL DuckDB → daily_ohlcv.parquet.
+        # Today's live prices are appended in-memory at intent time via get_final_pricing().
         if is_data_due(now, state):
-            logger.info("[data] refreshing HL prices and building combined OHLCV cache")
-            open_orders = run_fill_logger()
-            state = load_state(STATE_PATH)
-            state["has_open_orders"] = bool(open_orders)
-            state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
-            save_state(state, STATE_PATH)
+            logger.info("[data] rebuilding OHLCV cache from Binance + HL data")
             if TRADING_ENV != "testnet":
                 run_ohlcv_dl()
                 update_daily()
