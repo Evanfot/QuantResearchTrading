@@ -372,6 +372,7 @@ def main():
             if _missing:
                 logger.warning(f"[intent] {len(_missing)} coins absent from price cache, dropping from universe: {_missing}")
                 universe = [c for c in universe if c in prices_all.columns]
+                symbol_index = {sym: i for i, sym in enumerate(universe)}
             ltps = update_ltps()
             latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
             prices, returns_adj = get_final_pricing(prices_all, universe, latest_view)
