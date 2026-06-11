@@ -73,7 +73,11 @@ def _build_hl(hl_only: set[str]) -> pd.DataFrame:
     if not HL_DB_PATH.exists():
         return pd.DataFrame()
     symbols_sql = ", ".join(f"'{s}/USDC:USDC'" for s in sorted(hl_only))
-    conn = duckdb.connect(str(HL_DB_PATH), read_only=True)
+    try:
+        conn = duckdb.connect(str(HL_DB_PATH), read_only=True)
+    except Exception as e:
+        print(f"HL: could not open DuckDB ({e}), skipping HL-only symbols", flush=True)
+        return pd.DataFrame()
     try:
         df = conn.execute(f"""
             SELECT
