@@ -94,6 +94,7 @@ def update_daily():
     )
     GROUP BY symbol, DATE_TRUNC('day', datetime)
     HAVING COUNT(open) > 0;""")
+    con.close()
 
 
 def get_start_time(symbol: str) -> int:
