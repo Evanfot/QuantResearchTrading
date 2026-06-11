@@ -368,6 +368,10 @@ def main():
             universe, symbol_index = get_universe(top, hl, state.get("universe"))
 
             prices_all = get_ohlcv()
+            _missing = [c for c in universe if c not in prices_all.columns]
+            if _missing:
+                logger.warning(f"[intent] {len(_missing)} coins absent from price cache, dropping from universe: {_missing}")
+                universe = [c for c in universe if c in prices_all.columns]
             ltps = update_ltps()
             latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
             prices, returns_adj = get_final_pricing(prices_all, universe, latest_view)
