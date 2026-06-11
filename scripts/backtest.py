@@ -23,6 +23,9 @@ from src.backtester.full_backtest import run_backtest, StrategyConfig
 from src.signal import ewmac, breakout, scaled_bollinger, alpha006, alpha014, alpha020
 from src.data import get_hyperliquid_trading_universe, get_ohlcv, get_final_pricing, load_ohlcv_for_alphas
 # %%
+START_DATE = "2025-01-01"  # set to None to use all available data
+
+# %%
 top = get_latest_market_cap()
 hl = get_hl_coins()
 universe, symbol_index = get_hyperliquid_trading_universe(top, hl)
@@ -51,6 +54,14 @@ mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast,
               alpha006_forecast, alpha014_forecast, alpha020_forecast], axis=0)
 vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
 cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
+
+if START_DATE:
+    mask = prices.index >= pd.Timestamp(START_DATE)
+    prices = prices.loc[mask]
+    mu = mu[mask]
+    vo = vo[mask]
+    cor = cor.loc[prices.index]
+
 portfolio = run_backtest(prices, mu, vo, cor, config)
 portfolio.snapshot()
 
