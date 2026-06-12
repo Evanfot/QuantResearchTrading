@@ -60,6 +60,7 @@ def update_latest_view():
     ON t.symbol = latest.symbol
     AND t.datetime = latest.max_dt
     """)
+    con.close()
 
 def update_daily():
     # Ensure hyperliquid_1d exists with PK
@@ -94,7 +95,6 @@ def update_daily():
     )
     GROUP BY symbol, DATE_TRUNC('day', datetime)
     HAVING COUNT(open) > 0;""")
-    con.close()
 
 
 def get_start_time(symbol: str) -> int:
