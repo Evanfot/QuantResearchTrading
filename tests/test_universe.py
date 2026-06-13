@@ -1,6 +1,12 @@
 import pytest
 import pandas as pd
-from src.universe import get_universe, ADD_THRESHOLD, REMOVE_THRESHOLD, UNIVERSE_SIZE
+from src.universe import (
+    get_universe,
+    _eligible_ranked,
+    ADD_THRESHOLD,
+    REMOVE_THRESHOLD,
+    UNIVERSE_SIZE,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -218,3 +224,93 @@ def test_symbol_index_matches_universe():
     assert set(symbol_index.keys()) == set(universe)
     for sym, idx in symbol_index.items():
         assert universe[idx] == sym
+
+
+# ── Eligible vs Tradable: rank integrity ───────────────────────────────────────
+
+def test_eligible_ranking_is_independent_of_exchange_listing():
+    """Ranks are TRUE market-cap ranks — listing must not reorder them.
+
+    _eligible_ranked no longer takes the exchange-listing set; a coin's position
+    reflects its market-cap standing, not its position among listed coins.
+    """
+    syms = coins(60)
+    ranked = _eligible_ranked(make_market_cap(syms))
+    assert ranked == syms
+
+
+def test_stablecoins_and_excluded_do_not_consume_rank_slots():
+    """A stablecoin (or EXCLUDED token) sitting high by market cap is skipped,
+    so the coins below it keep their real, contiguous ranks."""
+    ranked = _eligible_ranked(make_market_cap(["BTC", "USDT", "ETH", "PAXG", "SOL"]))
+    assert ranked == ["BTC", "ETH", "SOL"]
+
+
+# ── Requirement: assets outside top N cannot enter ─────────────────────────────
+
+def test_untradable_top_coins_do_not_backfill_with_lower_ranks():
+    """The headline bug: if only some of the top N are tradable, the universe is
+    NOT padded with assets ranked beyond N.
+
+    100 eligible coins; ranks 31–50 are unlisted while ranks 1–30 and 51–100 are
+    listed. The old 'filter-first' logic produced ranks 1–30 + 51–70 (size 50).
+    The new logic returns only the tradable subset of the top 50.
+    """
+    syms = coins(100)
+    top = make_market_cap(syms)
+    hl = hl_set(syms[:30] + syms[UNIVERSE_SIZE:])   # ranks 1-30 and 51-100 listed
+
+    universe, _ = get_universe(top, hl, current_universe=None)
+
+    assert set(universe) == set(syms[:30])
+    assert all(s not in universe for s in syms[UNIVERSE_SIZE:]), "no rank-51+ back-fill"
+
+
+# ── Requirement: tradable universe size may be < N ─────────────────────────────
+
+def test_tradable_universe_may_be_smaller_than_n():
+    """Plenty of eligible coins exist, but few of the top N are tradable."""
+    syms = coins(100)
+    top = make_market_cap(syms)
+    hl = hl_set(syms[:20] + syms[60:])              # only 20 of the top 50 listed
+
+    universe, _ = get_universe(top, hl, current_universe=None)
+
+    assert len(universe) == 20
+    assert len(universe) < UNIVERSE_SIZE
+
+
+# ── Requirement: listing changes cannot promote lower-ranked assets ────────────
+
+def test_removal_does_not_backfill_beyond_top_n():
+    """Delisting a top coin frees a slot, but rank-51+ coins cannot fill it."""
+    syms = coins(100)
+    current = syms[:UNIVERSE_SIZE]
+    top = make_market_cap(syms)
+    hl = hl_set(syms[1:])                            # delist rank 1; 51+ all listed
+
+    universe, _ = get_universe(top, hl, current_universe=current)
+
+    assert syms[0] not in universe                  # delisted coin removed
+    assert syms[UNIVERSE_SIZE] not in universe      # rank 51 did NOT back-fill
+    assert set(universe) <= set(syms[:UNIVERSE_SIZE])
+
+
+def test_unlisted_top_ranks_do_not_inflate_a_coins_effective_rank():
+    """A coin at TRUE rank 48 (just outside ADD_THRESHOLD=47) must not be added,
+    even when every coin ranked above it is unlisted — which would make it the
+    highest-ranked *listed* coin under the old filter-first logic.
+    """
+    syms = coins(100)
+    new_coin = "NEW"
+    reranked = syms[:ADD_THRESHOLD] + [new_coin] + syms[ADD_THRESHOLD:]  # NEW at rank 48
+    top = make_market_cap(reranked)
+
+    # Only NEW and the two coins just below it are listed; ranks 1–47 are not.
+    current = [syms[ADD_THRESHOLD], syms[ADD_THRESHOLD + 1]]  # existing tradable holdings
+    hl = hl_set([new_coin] + current)
+
+    universe, _ = get_universe(top, hl, current_universe=current)
+
+    assert new_coin not in universe, "rank-48 coin must not be added despite empty top ranks"
+    assert set(universe) == set(current)

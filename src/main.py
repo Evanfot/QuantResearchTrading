@@ -15,7 +15,7 @@ from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset,
 from src.loggers.order_logger import OrderLogger
 from src.signal import alpha006, alpha014, alpha020, breakout, ewmac, scaled_bollinger
 from src.state.strategy_state import get_state_positions, load_state, save_state
-from src.universe import get_latest_market_cap, get_top_marketcap, get_universe, store_market_cap
+from src.universe import UNIVERSE_SIZE, get_latest_market_cap, get_top_marketcap, get_universe, store_market_cap
 
 # ── Scheduling constants ───────────────────────────────────────────────────────
 DATA_HOUR_UTC = 23
@@ -366,6 +366,11 @@ def main():
             top = get_latest_market_cap()
             hl = get_hl_coins()
             universe, symbol_index = get_universe(top, hl, state.get("universe"))
+            logger.info(
+                f"[intent] tradable universe: {len(universe)}/{UNIVERSE_SIZE} "
+                f"(top-{UNIVERSE_SIZE} by market cap, narrowed by exchange listing; "
+                f"size varies as listings change)"
+            )
 
             prices_all = get_ohlcv()
             _missing = [c for c in universe if c not in prices_all.columns]

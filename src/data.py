@@ -100,5 +100,10 @@ def get_hyperliquid_trading_universe(
     top_market_cap: pd.DataFrame,
     hl_universe: set,
 ) -> tuple[list[str], dict[str, int]]:
-    """Shim for analysis scripts — always returns the top-N initial universe."""
+    """Shim for analysis scripts — returns the first-run Tradable Universe.
+
+    The Tradable Universe is the top-N-by-market-cap Eligible Universe intersected
+    with the tradability filters; it may contain fewer than UNIVERSE_SIZE coins and
+    never includes assets ranked beyond the top N. See universe.get_universe.
+    """
     return get_universe(top_market_cap, hl_universe, current_universe=None)
