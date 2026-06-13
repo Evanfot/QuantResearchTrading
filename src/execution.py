@@ -82,6 +82,10 @@ def get_execution_plan(
             "limit_px": clean_px,
             "order_type": {"limit": {"tif": "Gtc"}},
             "reduce_only": False,
+            # intended-trade context (post dust-adjust, pre-rounding) for logging/attribution
+            "target_qty": target_qty,
+            "current_qty": current_qty,
+            "delta": delta,
         })
 
     return exchange_orders

@@ -477,7 +477,10 @@ def main():
 
             if not DRY_RUN and orders:
                 print(generate_readable_summary(orders, ltps))
-                response = ex.bulk_orders(orders)
+                # Strip to the fields the exchange expects; keep the full dict for logging.
+                wire_keys = ("coin", "is_buy", "sz", "limit_px", "order_type", "reduce_only")
+                wire_orders = [{k: o[k] for k in wire_keys} for o in orders]
+                response = ex.bulk_orders(wire_orders)
                 if response.get("status") == "ok":
                     all_statuses = response["response"]["data"]["statuses"]
                     for i, status in enumerate(all_statuses):
@@ -491,6 +494,9 @@ def main():
                             order_type="LIMIT",
                             price=order_info["limit_px"],
                             qty=order_info["sz"],
+                            target_qty=order_info.get("target_qty"),
+                            current_qty=order_info.get("current_qty"),
+                            delta=order_info.get("delta"),
                             response={"response": {"data": {"statuses": [status]}}},
                         )
                     logging.info(f"[exec] Rebalance triggered — {len(orders)} orders submitted")
