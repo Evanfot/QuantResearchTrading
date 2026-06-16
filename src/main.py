@@ -28,6 +28,7 @@ META_HOUR_UTC = 23
 META_MINUTE_UTC = 45
 TRADING_EXEC_HOUR_UTC = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
+HALT_RETRY_MINUTES = 5  # retry cadence after a transient "Trading is halted." rejection
 TRADING_INTENT_HOUR_UTC = 0
 TRADING_INTENT_MINUTE_UTC = 1
 POSITION_CHECK_INTERVAL_HOURS = 1
@@ -498,6 +499,7 @@ def main():
 
                 orders = get_execution_plan(order_intentions, ltps, sz_decimals, logger, positions=positions)
 
+                halted = False
                 if not DRY_RUN and orders:
                     print(generate_readable_summary(orders, ltps))
                     response = ex.bulk_orders(orders)
@@ -532,6 +534,9 @@ def main():
                                 f"[exec] {len(rejected)}/{len(orders)} orders rejected by exchange "
                                 f"(accepted {accepted})"
                             )
+                            # "Trading is halted." is a transient exchange-side condition;
+                            # flag it so we retry soon instead of waiting the full interval.
+                            halted = any("halt" in err.lower() for _, err in rejected)
                         if accepted:
                             logging.info(f"[exec] Rebalance triggered — {accepted}/{len(orders)} orders accepted")
                     else:
@@ -541,7 +546,14 @@ def main():
                 state = load_state(STATE_PATH)
                 state["has_open_orders"] = bool(open_orders)
                 state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
-                state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
+                if halted:
+                    # Backdate the exec gate so the next tick is due in ~HALT_RETRY_MINUTES
+                    # rather than the full interval — resume promptly when the halt lifts.
+                    retry_offset = dt.timedelta(minutes=TRADING_EXEC_INTERVAL_MINUTES - HALT_RETRY_MINUTES)
+                    state["last_trading_exec_ms"] = int((now - retry_offset).timestamp() * 1000)
+                    logger.warning(f"[exec] exchange halted — retrying in ~{HALT_RETRY_MINUTES} min")
+                else:
+                    state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
                 save_state(state, STATE_PATH)
             except Exception:
                 logger.warning("[exec] failed", exc_info=True)
