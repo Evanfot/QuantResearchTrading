@@ -41,7 +41,9 @@ def read_latest_meta():
 
 def get_hl_coins():
     data = read_latest_meta()
-    return {x["name"].upper() for x in data["universe"]}
+    # Exclude delisted perps — HL rejects any order on them with "Trading is halted.",
+    # so they must not enter the tradeable universe.
+    return {x["name"].upper() for x in data["universe"] if not x.get("isDelisted")}
 
 if __name__ == "__main__":
     meta = fetch_meta()

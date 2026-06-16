@@ -503,6 +503,8 @@ def main():
                     response = ex.bulk_orders(orders)
                     if response.get("status") == "ok":
                         all_statuses = response["response"]["data"]["statuses"]
+                        accepted = 0
+                        rejected = []
                         for i, status in enumerate(all_statuses):
                             order_info = orders[i]
                             order_logger.log_order_submission(
@@ -516,9 +518,24 @@ def main():
                                 qty=order_info["sz"],
                                 response={"response": {"data": {"statuses": [status]}}},
                             )
-                        logging.info(f"[exec] Rebalance triggered — {len(orders)} orders submitted")
+                            # HL returns top-level "ok" even when individual orders are
+                            # rejected ({"error": ...}); surface those instead of counting
+                            # them as submitted.
+                            if isinstance(status, dict) and "error" in status:
+                                rejected.append((order_info["coin"], status["error"]))
+                            else:
+                                accepted += 1
+                        for coin, err in rejected:
+                            logger.error(f"[exec] order REJECTED — {coin}: {err}")
+                        if rejected:
+                            logger.warning(
+                                f"[exec] {len(rejected)}/{len(orders)} orders rejected by exchange "
+                                f"(accepted {accepted})"
+                            )
+                        if accepted:
+                            logging.info(f"[exec] Rebalance triggered — {accepted}/{len(orders)} orders accepted")
                     else:
-                        print(f"Bulk submission failed: {response}")
+                        logger.error(f"[exec] bulk submission failed (top-level): {response}")
 
                 open_orders = run_fill_logger()
                 state = load_state(STATE_PATH)
