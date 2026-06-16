@@ -11,7 +11,7 @@ import pandas as pd
 
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
 from src.data import db_path, get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
-from src.execution import generate_readable_summary, get_execution_plan, get_order_intention
+from src.execution import classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
 from src.loggers.order_logger import OrderLogger
@@ -505,40 +505,39 @@ def main():
                     response = ex.bulk_orders(orders)
                     if response.get("status") == "ok":
                         all_statuses = response["response"]["data"]["statuses"]
-                        accepted = 0
-                        rejected = []
-                        for i, status in enumerate(all_statuses):
-                            order_info = orders[i]
+                        # HL returns top-level "ok" even when individual orders are
+                        # rejected ({"error": ...}); classify each status so rejections
+                        # (and their reason) are surfaced instead of counted as submitted.
+                        result = classify_order_responses(orders, all_statuses)
+                        if result.count_mismatch:
+                            logger.error(
+                                f"[exec] status count {len(all_statuses)} != order count "
+                                f"{len(orders)} — response may be misaligned: {response}"
+                            )
+                        for co in result.classified:
                             order_logger.log_order_submission(
                                 run_id=run_id,
                                 exchange="hyperliquid",
                                 account=WALLET_ADDRESS,
-                                symbol=order_info["coin"],
-                                side="buy" if order_info["is_buy"] else "sell",
+                                symbol=co.coin,
+                                side="buy" if co.order["is_buy"] else "sell",
                                 order_type="LIMIT",
-                                price=order_info["limit_px"],
-                                qty=order_info["sz"],
-                                response={"response": {"data": {"statuses": [status]}}},
+                                price=co.order["limit_px"],
+                                qty=co.order["sz"],
+                                response={"response": {"data": {"statuses": [co.raw_status]}}},
                             )
-                            # HL returns top-level "ok" even when individual orders are
-                            # rejected ({"error": ...}); surface those instead of counting
-                            # them as submitted.
-                            if isinstance(status, dict) and "error" in status:
-                                rejected.append((order_info["coin"], status["error"]))
-                            else:
-                                accepted += 1
-                        for coin, err in rejected:
-                            logger.error(f"[exec] order REJECTED — {coin}: {err}")
-                        if rejected:
+                        for co in result.rejected:
+                            logger.error(f"[exec] order REJECTED [{co.status.value}] — {co.coin}: {co.error}")
+                        if result.rejected:
                             logger.warning(
-                                f"[exec] {len(rejected)}/{len(orders)} orders rejected by exchange "
-                                f"(accepted {accepted})"
+                                f"[exec] {len(result.rejected)}/{len(orders)} orders rejected by exchange "
+                                f"(accepted {len(result.accepted)})"
                             )
                             # "Trading is halted." is a transient exchange-side condition;
                             # flag it so we retry soon instead of waiting the full interval.
-                            halted = any("halt" in err.lower() for _, err in rejected)
-                        if accepted:
-                            logging.info(f"[exec] Rebalance triggered — {accepted}/{len(orders)} orders accepted")
+                            halted = result.halted
+                        if result.accepted:
+                            logging.info(f"[exec] Rebalance triggered — {len(result.accepted)}/{len(orders)} orders accepted")
                     else:
                         logger.error(f"[exec] bulk submission failed (top-level): {response}")
 
