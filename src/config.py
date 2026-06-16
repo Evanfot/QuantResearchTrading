@@ -1,7 +1,11 @@
+import logging
 import os
+import time
 
 from dotenv import load_dotenv
 from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -34,7 +38,10 @@ def _testnet_meta():
     return r.json()
 
 
-def make_info():
+_INFO = None
+
+
+def _build_info():
     from hyperliquid.info import Info
     if TRADING_ENV == "testnet":
         # Testnet API rejects the `dex` field the SDK sends in both spot_meta
@@ -42,6 +49,37 @@ def make_info():
         meta = _testnet_meta()
         return Info(HL_API_URL, skip_ws=True, meta=meta, spot_meta={"universe": [], "tokens": []})
     return Info(HL_API_URL, skip_ws=True)
+
+
+def make_info(force: bool = False, max_attempts: int = 5):
+    """Return a process-wide cached Info instance.
+
+    Constructing Info fires two metadata POSTs (spotMeta + meta), so we build it
+    once and reuse it instead of hammering /info on every poll cycle (which was
+    triggering CloudFront 429s). Construction is retried with exponential backoff
+    so a transient rate-limit doesn't crash the cycle. Pass force=True to rebuild.
+    """
+    global _INFO
+    if _INFO is not None and not force:
+        return _INFO
+
+    from hyperliquid.utils.error import ClientError
+
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            _INFO = _build_info()
+            return _INFO
+        except ClientError as e:
+            # Only back off and retry on rate-limit; re-raise anything else.
+            if getattr(e, "status_code", None) != 429 or attempt == max_attempts:
+                raise
+            logger.warning(
+                "[make_info] 429 rate-limited building Info "
+                f"(attempt {attempt}/{max_attempts}), retrying in {delay:.0f}s"
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 30.0)
 
 
 def open_orders(info, address):
