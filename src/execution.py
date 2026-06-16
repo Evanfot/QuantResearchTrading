@@ -198,6 +198,65 @@ def get_execution_plan(
     return exchange_orders
 
 
+@dataclass
+class PreflightResult:
+    """Outcome of the pre-submission sanity gate."""
+
+    ok: bool
+    violations: List[str]
+
+
+def preflight_check(
+    orders: list,
+    ltps: dict,
+    *,
+    max_order_notional_usd: float,
+    max_gross_notional_usd: float,
+    max_order_count: int,
+    max_price_deviation: float = 0.05,
+) -> PreflightResult:
+    """Sanity-gate a batch of orders before submission.
+
+    Catches the fat-finger / stale-price / runaway-batch classes of error that
+    unit tests can't anticipate: a decimal or units bug inflating one order, a
+    limit price wildly off the mid it was derived from, or a systemic bug
+    inflating the whole batch. Returns ``ok=False`` with human-readable
+    violations; the caller blocks the *entire* submission on any violation
+    rather than letting a suspect batch reach the exchange.
+
+    Caps are passed in (the caller derives the notional ones from live equity) so
+    this stays pure and testable.
+    """
+    violations: List[str] = []
+
+    if len(orders) > max_order_count:
+        violations.append(f"order count {len(orders)} > cap {max_order_count}")
+
+    gross = 0.0
+    for o in orders:
+        coin = o["coin"]
+        px = o["limit_px"]
+        notional = abs(o["sz"]) * px
+        gross += notional
+        if notional > max_order_notional_usd:
+            violations.append(
+                f"{coin} order notional ${notional:,.0f} > per-order cap ${max_order_notional_usd:,.0f}"
+            )
+        ltp = ltps.get(coin, 0)
+        if not ltp:
+            violations.append(f"{coin} has no reference price for sanity check")
+        elif abs(px - ltp) / ltp > max_price_deviation:
+            violations.append(
+                f"{coin} limit_px {px:g} deviates {abs(px - ltp) / ltp * 100:.1f}% "
+                f"from mid {ltp:g} (cap {max_price_deviation * 100:.0f}%)"
+            )
+
+    if gross > max_gross_notional_usd:
+        violations.append(f"gross order notional ${gross:,.0f} > batch cap ${max_gross_notional_usd:,.0f}")
+
+    return PreflightResult(ok=not violations, violations=violations)
+
+
 def generate_readable_summary(orders, ltps):
     result = pd.DataFrame(orders).set_index("coin")[["is_buy", "sz", "limit_px"]]
     result["dir"] = result["is_buy"].map({True: "BUY", False: "SELL"})

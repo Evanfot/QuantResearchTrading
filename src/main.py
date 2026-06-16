@@ -11,7 +11,7 @@ import pandas as pd
 
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
 from src.data import db_path, get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
-from src.execution import classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention
+from src.execution import classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
 from src.loggers.order_logger import OrderLogger
@@ -29,6 +29,16 @@ META_MINUTE_UTC = 45
 TRADING_EXEC_HOUR_UTC = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
 HALT_RETRY_MINUTES = 5  # retry cadence after a transient "Trading is halted." rejection
+
+# ── Pre-flight circuit-breaker caps ─────────────────────────────────────────────
+# Calibrated against real intent history on this account (~$1.8k equity): per-order
+# notional maxed ~0.6x equity, gross batch ~4.6x, count ~49. Caps sit well above a
+# legitimate rebalance/flip but trip on ~10x fat-finger / stale-price / runaway bugs.
+# On a trip the whole batch is blocked and retried next cycle (nothing is submitted).
+PREFLIGHT_MAX_ORDER_NOTIONAL_MULT = 3.0    # x equity — single-order ceiling
+PREFLIGHT_MAX_GROSS_NOTIONAL_MULT = 12.0   # x equity — total-batch ceiling
+PREFLIGHT_MAX_ORDER_COUNT = 120
+PREFLIGHT_MAX_PRICE_DEVIATION = 0.05       # limit_px vs mid sanity (price-construction bugs)
 TRADING_INTENT_HOUR_UTC = 0
 TRADING_INTENT_MINUTE_UTC = 1
 POSITION_CHECK_INTERVAL_HOURS = 1
@@ -498,6 +508,29 @@ def main():
                         logger.debug(f"Cancel Response: {resp}")
 
                 orders = get_execution_plan(order_intentions, ltps, sz_decimals, logger, positions=positions)
+
+                # ── Pre-flight circuit breaker ───────────────────────────────
+                # Sanity-gate the batch before it reaches the exchange. On any
+                # violation, block the whole submission and retry next cycle.
+                equity = float(intent_from_file["portfolio"].get("equity_used_for_sizing") or 0)
+                if orders and equity > 0:
+                    preflight = preflight_check(
+                        orders, ltps,
+                        max_order_notional_usd=PREFLIGHT_MAX_ORDER_NOTIONAL_MULT * equity,
+                        max_gross_notional_usd=PREFLIGHT_MAX_GROSS_NOTIONAL_MULT * equity,
+                        max_order_count=PREFLIGHT_MAX_ORDER_COUNT,
+                        max_price_deviation=PREFLIGHT_MAX_PRICE_DEVIATION,
+                    )
+                    if not preflight.ok:
+                        for v in preflight.violations:
+                            logger.error(f"[exec] preflight BLOCKED: {v}")
+                        logger.error(
+                            f"[exec] circuit breaker tripped — skipping submission of "
+                            f"{len(orders)} orders this tick"
+                        )
+                        orders = []  # block all; existing flow records the tick and retries next cycle
+                elif orders:
+                    logger.warning("[exec] preflight skipped — equity unknown, can't size notional caps")
 
                 halted = False
                 if not DRY_RUN and orders:
