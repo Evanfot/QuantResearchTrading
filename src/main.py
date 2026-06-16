@@ -11,7 +11,7 @@ import pandas as pd
 
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
 from src.data import db_path, get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
-from src.execution import generate_readable_summary, get_execution_plan, get_order_intention
+from src.execution import classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
 from src.loggers.order_logger import OrderLogger
@@ -28,6 +28,17 @@ META_HOUR_UTC = 23
 META_MINUTE_UTC = 45
 TRADING_EXEC_HOUR_UTC = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
+HALT_RETRY_MINUTES = 5  # retry cadence after a transient "Trading is halted." rejection
+
+# ── Pre-flight circuit-breaker caps ─────────────────────────────────────────────
+# Calibrated against real intent history on this account (~$1.8k equity): per-order
+# notional maxed ~0.6x equity, gross batch ~4.6x, count ~49. Caps sit well above a
+# legitimate rebalance/flip but trip on ~10x fat-finger / stale-price / runaway bugs.
+# On a trip the whole batch is blocked and retried next cycle (nothing is submitted).
+PREFLIGHT_MAX_ORDER_NOTIONAL_MULT = 3.0    # x equity — single-order ceiling
+PREFLIGHT_MAX_GROSS_NOTIONAL_MULT = 12.0   # x equity — total-batch ceiling
+PREFLIGHT_MAX_ORDER_COUNT = 120
+PREFLIGHT_MAX_PRICE_DEVIATION = 0.05       # limit_px vs mid sanity (price-construction bugs)
 TRADING_INTENT_HOUR_UTC = 0
 TRADING_INTENT_MINUTE_UTC = 1
 POSITION_CHECK_INTERVAL_HOURS = 1
@@ -498,42 +509,68 @@ def main():
 
                 orders = get_execution_plan(order_intentions, ltps, sz_decimals, logger, positions=positions)
 
+                # ── Pre-flight circuit breaker ───────────────────────────────
+                # Sanity-gate the batch before it reaches the exchange. On any
+                # violation, block the whole submission and retry next cycle.
+                equity = float(intent_from_file["portfolio"].get("equity_used_for_sizing") or 0)
+                if orders and equity > 0:
+                    preflight = preflight_check(
+                        orders, ltps,
+                        max_order_notional_usd=PREFLIGHT_MAX_ORDER_NOTIONAL_MULT * equity,
+                        max_gross_notional_usd=PREFLIGHT_MAX_GROSS_NOTIONAL_MULT * equity,
+                        max_order_count=PREFLIGHT_MAX_ORDER_COUNT,
+                        max_price_deviation=PREFLIGHT_MAX_PRICE_DEVIATION,
+                    )
+                    if not preflight.ok:
+                        for v in preflight.violations:
+                            logger.error(f"[exec] preflight BLOCKED: {v}")
+                        logger.error(
+                            f"[exec] circuit breaker tripped — skipping submission of "
+                            f"{len(orders)} orders this tick"
+                        )
+                        orders = []  # block all; existing flow records the tick and retries next cycle
+                elif orders:
+                    logger.warning("[exec] preflight skipped — equity unknown, can't size notional caps")
+
+                halted = False
                 if not DRY_RUN and orders:
                     print(generate_readable_summary(orders, ltps))
                     response = ex.bulk_orders(orders)
                     if response.get("status") == "ok":
                         all_statuses = response["response"]["data"]["statuses"]
-                        accepted = 0
-                        rejected = []
-                        for i, status in enumerate(all_statuses):
-                            order_info = orders[i]
+                        # HL returns top-level "ok" even when individual orders are
+                        # rejected ({"error": ...}); classify each status so rejections
+                        # (and their reason) are surfaced instead of counted as submitted.
+                        result = classify_order_responses(orders, all_statuses)
+                        if result.count_mismatch:
+                            logger.error(
+                                f"[exec] status count {len(all_statuses)} != order count "
+                                f"{len(orders)} — response may be misaligned: {response}"
+                            )
+                        for co in result.classified:
                             order_logger.log_order_submission(
                                 run_id=run_id,
                                 exchange="hyperliquid",
                                 account=WALLET_ADDRESS,
-                                symbol=order_info["coin"],
-                                side="buy" if order_info["is_buy"] else "sell",
+                                symbol=co.coin,
+                                side="buy" if co.order["is_buy"] else "sell",
                                 order_type="LIMIT",
-                                price=order_info["limit_px"],
-                                qty=order_info["sz"],
-                                response={"response": {"data": {"statuses": [status]}}},
+                                price=co.order["limit_px"],
+                                qty=co.order["sz"],
+                                response={"response": {"data": {"statuses": [co.raw_status]}}},
                             )
-                            # HL returns top-level "ok" even when individual orders are
-                            # rejected ({"error": ...}); surface those instead of counting
-                            # them as submitted.
-                            if isinstance(status, dict) and "error" in status:
-                                rejected.append((order_info["coin"], status["error"]))
-                            else:
-                                accepted += 1
-                        for coin, err in rejected:
-                            logger.error(f"[exec] order REJECTED — {coin}: {err}")
-                        if rejected:
+                        for co in result.rejected:
+                            logger.error(f"[exec] order REJECTED [{co.status.value}] — {co.coin}: {co.error}")
+                        if result.rejected:
                             logger.warning(
-                                f"[exec] {len(rejected)}/{len(orders)} orders rejected by exchange "
-                                f"(accepted {accepted})"
+                                f"[exec] {len(result.rejected)}/{len(orders)} orders rejected by exchange "
+                                f"(accepted {len(result.accepted)})"
                             )
-                        if accepted:
-                            logging.info(f"[exec] Rebalance triggered — {accepted}/{len(orders)} orders accepted")
+                            # "Trading is halted." is a transient exchange-side condition;
+                            # flag it so we retry soon instead of waiting the full interval.
+                            halted = result.halted
+                        if result.accepted:
+                            logging.info(f"[exec] Rebalance triggered — {len(result.accepted)}/{len(orders)} orders accepted")
                     else:
                         logger.error(f"[exec] bulk submission failed (top-level): {response}")
 
@@ -541,7 +578,14 @@ def main():
                 state = load_state(STATE_PATH)
                 state["has_open_orders"] = bool(open_orders)
                 state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
-                state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
+                if halted:
+                    # Backdate the exec gate so the next tick is due in ~HALT_RETRY_MINUTES
+                    # rather than the full interval — resume promptly when the halt lifts.
+                    retry_offset = dt.timedelta(minutes=TRADING_EXEC_INTERVAL_MINUTES - HALT_RETRY_MINUTES)
+                    state["last_trading_exec_ms"] = int((now - retry_offset).timestamp() * 1000)
+                    logger.warning(f"[exec] exchange halted — retrying in ~{HALT_RETRY_MINUTES} min")
+                else:
+                    state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
                 save_state(state, STATE_PATH)
             except Exception:
                 logger.warning("[exec] failed", exc_info=True)
