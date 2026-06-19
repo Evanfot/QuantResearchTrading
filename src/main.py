@@ -238,7 +238,7 @@ def main():
     from eth_account import Account
     from hyperliquid.exchange import Exchange
     from src.config import make_info, open_orders as hl_open_orders, HL_API_URL, PRIVATE_KEY, WALLET_ADDRESS, API_ADDRESS
-    from scripts.exchange_state import read_latest_exchange_state, run_exchange_state
+    from scripts.exchange_state import read_latest_exchange_state, run_exchange_state, get_account_equity
     from scripts.meta_data import get_hl_coins, read_latest_meta
     from scripts.run_fill_logger import main as run_fill_logger
     from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily, update_latest_view
@@ -417,8 +417,9 @@ def main():
 
             intent["universe"]["tradable"] = tradable
             intent = initialise_asset_intent(intent, tradable)
-            intent["portfolio"]["equity_usd"] = float(exchange_state["marginSummary"]["accountValue"])
-            intent["portfolio"]["equity_used_for_sizing"] = float(exchange_state["marginSummary"]["accountValue"])
+            account_equity = get_account_equity(exchange_state)
+            intent["portfolio"]["equity_usd"] = account_equity
+            intent["portfolio"]["equity_used_for_sizing"] = account_equity
             intent["portfolio"]["maintenance_margin"] = exchange_state["crossMaintenanceMarginUsed"]
             intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state["marginSummary"]["totalNtlPos"]
             intent = add_ltp_to_intent(intent, latest_view)
