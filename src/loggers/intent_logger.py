@@ -3,14 +3,28 @@ import json
 import datetime as dt
 import uuid
 
-def init_intent(mode, strategy_name, run_id):
+def init_intent(mode, strategy_name, run_id, provenance=None):
+    meta = {
+        "run_id": run_id,
+        "schema_version": 2,          # 2 = MVO sizing block + model fields + provenance
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "mode": mode,                 #"live" / "backtest"
+        "strategy": strategy_name,
+        "strategy_components": None,  # {alpha_model, risk_model, allocator} from registry
+        "git_commit": None,
+        "git_dirty": None,
+        "config_hash": None,
+    }
+    if provenance:
+        # Denormalise the registry manifest + run provenance into the log line so
+        # each record stays self-contained and reproducible.
+        meta["strategy"] = provenance.get("strategy", strategy_name)
+        meta["strategy_components"] = provenance.get("strategy_components")
+        meta["git_commit"] = provenance.get("git_commit")
+        meta["git_dirty"] = provenance.get("git_dirty")
+        meta["config_hash"] = provenance.get("config_hash")
     return {
-        "meta": {
-            "run_id": run_id,
-            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "mode": mode,                 #"live" / "backtest"
-            "strategy": strategy_name,
-        },
+        "meta": meta,
 
         "portfolio": {
             "equity_usd": None,
@@ -18,6 +32,21 @@ def init_intent(mode, strategy_name, run_id):
             "gross_exposure_pre_rebal": None,
             "net_exposure_pre_rebal": None,
             "maintenance_margin":None,
+        },
+
+        # Portfolio-level sizing decision (populated by the active sizing model).
+        "sizing": {
+            "model": None,                # "mvo_max_sharpe" | "risk_parity"
+            "sizing_rule": None,          # e.g. "vol_target"
+            "target_vol_daily": None,
+            "target_vol_annual": None,
+            "trading_days": None,
+            "max_position_weight": None,
+            "gamma": None,
+            "applied_leverage": None,     # leverage applied to the tangency book
+            "expected_vol_annual": None,  # model's expected annualised book vol
+            "gross_leverage": None,       # sum(|target_weight|)
+            "portfolio_mu": None,         # tangency expected excess return
         },
 
         "risk_inputs": {
@@ -50,8 +79,10 @@ def init_asset() -> dict:
         "model": {
             "signal": None,
             "vol_1d": None,
-            "risk_position":None,
-            "target_weight": None,
+            "risk_position": None,        # risk-parity only (None under MVO)
+            "tangency_weight": None,      # MVO max-Sharpe direction (None under risk-parity)
+            "capped": None,               # MVO: did per-asset cap bind for this asset?
+            "target_weight": None,        # final weight (fraction of equity) — both models
         },
         "current": {
             "qty": None

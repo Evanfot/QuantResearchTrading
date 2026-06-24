@@ -24,6 +24,18 @@ class StrategyConfig:
     weight_multiplier: float = 0.025
     small_threshold: float = 10.0
 
+    # ── Sizing model selection ──────────────────────────────────────────────
+    sizing_model: str = "mvo"             # "mvo" | "risk_parity" (instant rollback)
+    # MVO (max-Sharpe + vol-target) params — see full_backtest_mvo.MVOConfig
+    mvo_target_vol_daily: float = 0.022   # daily vol target (~2.5%/day realised)
+    mvo_trading_days: int = 365           # annualisation basis (crypto 24/7/365)
+    mvo_max_position_weight: float = 0.30 # cap |weight| per asset (frac of equity)
+    mvo_gamma: float = 0.1
+    mvo_rf: float = 0.15
+    mvo_kelly_fraction: float = 0.25
+    mvo_lookback: int = 252
+    mvo_min_periods: int = 60
+
 
 @dataclass
 class StrategyIntent:

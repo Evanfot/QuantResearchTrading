@@ -1,0 +1,51 @@
+# Strategy registry — single source of truth for what a "strategy" means.
+#
+# The id stamped into intent.meta.strategy maps here to its component models
+# (alpha / risk / allocator) for provenance + reproducibility. Code only READS
+# this file (stdlib tomllib); it is hand-edited. To reproduce a run exactly,
+# combine intent.meta.strategy (semantics) + git_commit (code) + config_hash
+# (the resolved params actually used).
+
+# ── Strategies ───────────────────────────────────────────────────────────────
+
+[strategies."trend_v1.1"]
+alpha_model = "combined_alpha_v1"
+risk_model  = "ewm_corr_shrink_v1"
+allocator   = "risk_parity_v1"
+created     = "2026-01-15"
+status      = "retired"
+description = "Original live trend strategy (risk-parity). Kept so historical intent logs that stamped 'trend_v1.1' still resolve. Superseded by trend_rp_v1."
+
+[strategies.trend_rp_v1]
+alpha_model = "combined_alpha_v1"
+risk_model  = "ewm_corr_shrink_v1"
+allocator   = "risk_parity_v1"
+created     = "2026-06-24"
+status      = "live"
+description = "Risk-parity allocator: correlation-shrunk inverse-variance solve, scaled by 1/vol. Rollback target for trend_mvo_v1."
+
+[strategies.trend_mvo_v1]
+alpha_model = "combined_alpha_v1"
+risk_model  = "ledoit_wolf_v1"
+allocator   = "mvo_maxsharpe_voltarget_v1"
+created     = "2026-06-24"
+status      = "live"
+description = "Max-Sharpe tangency portfolio sized to a 2.2%/day vol target (365-annualised) with a 30% per-position cap."
+
+# ── Component descriptions (documentation; not required by the loader) ────────
+
+[components.alpha.combined_alpha_v1]
+signals     = ["bollinger", "ewmac", "breakout", "alpha006", "alpha014", "alpha020"]
+description = "Equal-weight mean of trend-following + formulaic-alpha signals."
+
+[components.risk.ewm_corr_shrink_v1]
+description = "EWM correlation shrunk toward identity (shrink2id); EWM 1-day vol."
+
+[components.risk.ledoit_wolf_v1]
+description = "Ledoit-Wolf covariance shrinkage (PyPortfolioOpt), 365-annualised."
+
+[components.allocator.risk_parity_v1]
+description = "Inverse-variance solve normalised by A-norm, scaled by 1/vol."
+
+[components.allocator.mvo_maxsharpe_voltarget_v1]
+description = "Max-Sharpe efficient frontier (L2 reg) levered to a daily vol target, with a per-position cap."
