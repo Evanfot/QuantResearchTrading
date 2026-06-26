@@ -25,7 +25,9 @@ class StrategyConfig:
     small_threshold: float = 10.0
 
     # ── Sizing model selection ──────────────────────────────────────────────
-    sizing_model: str = "mvo"             # "mvo" | "risk_parity" (instant rollback)
+    # Live default stays "risk_parity" while MVO is validated via SHADOW_SIZING;
+    # flip to "mvo" to promote it (the other model then runs as the shadow).
+    sizing_model: str = "risk_parity"     # "mvo" | "risk_parity"
     # MVO (max-Sharpe + vol-target) params — see full_backtest_mvo.MVOConfig
     mvo_target_vol_daily: float = 0.022   # daily vol target (~2.5%/day realised)
     mvo_trading_days: int = 365           # annualisation basis (crypto 24/7/365)

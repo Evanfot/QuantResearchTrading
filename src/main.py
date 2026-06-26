@@ -1,7 +1,9 @@
+import copy
 import datetime as dt
 import logging
 import os
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
@@ -45,7 +47,15 @@ TRADING_INTENT_HOUR_UTC = 0
 TRADING_INTENT_MINUTE_UTC = 1
 POSITION_CHECK_INTERVAL_HOURS = 1
 
-DRY_RUN = False
+def _env_flag(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Compute orders but never cancel/submit to the exchange (intents still logged).
+DRY_RUN = _env_flag("DRY_RUN", False)
+# Also compute + log the *other* sizing model to a side file for parallel
+# validation, without ever feeding it to the executor.
+SHADOW_SIZING = _env_flag("SHADOW_SIZING", False)
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +302,33 @@ def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_vi
     return order_intentions
 
 
+def run_shadow_sizing(prices, mu, vo, cor, positions, ltps, base_intent, live_config,
+                      latest_view, logger, shadow_logger):
+    """Compute + log the *other* sizing model on the same inputs, to a side file.
+
+    Reuses run_live so the shadow record is a full intent (weights + would-be
+    order intentions vs the real book), but its return value is discarded and the
+    executor never reads ``shadow_logger``'s file — so no real-money path touches it.
+    """
+    shadow_model = "mvo" if live_config.sizing_model != "mvo" else "risk_parity"
+    shadow_config = replace(live_config, sizing_model=shadow_model)
+
+    # Deep-copy the pre-sizing base (same market/signal/risk/portfolio inputs);
+    # re-stamp meta provenance for the shadow strategy (keep run_id/git to join).
+    shadow_intent = copy.deepcopy(base_intent)
+    prov = strategy_registry.provenance(shadow_config)
+    shadow_intent["meta"]["strategy"] = prov["strategy"]
+    shadow_intent["meta"]["strategy_components"] = prov["strategy_components"]
+    shadow_intent["meta"]["config_hash"] = prov["config_hash"]
+
+    try:
+        run_live(prices, mu, vo, cor, positions, ltps, shadow_intent, shadow_config,
+                 latest_view, logger, shadow_logger)
+        logger.info(f"[shadow] logged {prov['strategy']} intent to side file")
+    except Exception:
+        logger.warning("[shadow] sizing failed — live path unaffected", exc_info=True)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
@@ -322,6 +359,8 @@ def main():
 
     intent_logger = IntentLogger(f"logs/intent_{TRADING_ENV}.jsonl")
     order_logger = OrderLogger(f"logs/orders_{TRADING_ENV}.jsonl")
+    # Parallel-validation sink: the executor never reads this file.
+    shadow_intent_logger = IntentLogger(f"logs/intent_{TRADING_ENV}_shadow.jsonl")
 
     state = load_state(STATE_PATH)
 
@@ -523,7 +562,15 @@ def main():
                 }
             intent["risk_inputs"]["correlation_matrix"] = cor.loc[prices.index[-1]].to_dict()
 
+            # Snapshot the pre-sizing intent so the shadow runs off identical inputs.
+            shadow_base = copy.deepcopy(intent) if SHADOW_SIZING else None
+
             run_live(prices, mu, vo, cor, positions, ltps, intent, config, latest_view, logger, intent_logger)
+
+            if SHADOW_SIZING:
+                run_shadow_sizing(prices, mu, vo, cor, positions, ltps, shadow_base, config,
+                                  latest_view, logger, shadow_intent_logger)
+
             state["last_trading_intent_run_id"] = run_id
             state["universe"] = universe
             save_state(state, STATE_PATH)
