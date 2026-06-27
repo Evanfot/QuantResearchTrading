@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     image: trend_trader:mainnet
     container_name: trader
     restart: unless-stopped
@@ -10,6 +12,8 @@ services:
       - .env
     environment:
       BINANCE_DATA_ROOT: /app
+      SHADOW_SIZING: ${SHADOW_SIZING:-false}
+      DRY_RUN: ${DRY_RUN:-false}
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state

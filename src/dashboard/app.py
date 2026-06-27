@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from scripts.exchange_state import read_latest_exchange_state
+from scripts.exchange_state import read_latest_exchange_state, get_account_equity
 from src.loggers.intent_logger import IntentLogger
 from src.positions.position_rebuilder import PositionRebuilder
 from src.state.strategy_state import load_state
@@ -197,7 +197,7 @@ def load_day_open_mids():
 def compute_portfolio_vol(exchange_state, intent):
     """Annualised portfolio volatility from current position weights and latest intent."""
     try:
-        account_value = float(exchange_state["marginSummary"]["accountValue"])
+        account_value = get_account_equity(exchange_state)
         if account_value <= 0:
             return None
 
@@ -586,8 +586,7 @@ def build_page():
     day_open_mids = load_day_open_mids()
     prev_fills, today_fills = load_fills_split()
 
-    margin = exchange_state.get("marginSummary", {})
-    account_value = float(margin.get("accountValue", 0))
+    account_value = get_account_equity(exchange_state)
     withdrawable = float(exchange_state.get("withdrawable", 0))
     positions_raw = exchange_state.get("assetPositions", [])
 

@@ -1,6 +1,9 @@
+import copy
 import datetime as dt
 import logging
 import os
+import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
@@ -8,8 +11,10 @@ import numpy as np
 import pandas as pd
 
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
+from src.backtester.full_backtest_mvo import MVOConfig, MVOIntent, compute_strategy_mvo
+from src.strategy import registry as strategy_registry
 from src.data import get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
-from src.execution import generate_readable_summary, get_execution_plan, get_order_intention
+from src.execution import classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
 from src.loggers.order_logger import OrderLogger
@@ -26,11 +31,30 @@ META_HOUR_UTC = 23
 META_MINUTE_UTC = 40
 TRADING_EXEC_HOUR_UTC = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
+HALT_RETRY_MINUTES = 5  # retry cadence after a transient "Trading is halted." rejection
+
+# ── Pre-flight circuit-breaker caps ─────────────────────────────────────────────
+# Calibrated against real intent history on this account (~$1.8k equity): per-order
+# notional maxed ~0.6x equity, gross batch ~4.6x, count ~49. Caps sit well above a
+# legitimate rebalance/flip but trip on ~10x fat-finger / stale-price / runaway bugs.
+# On a trip the whole batch is blocked and retried next cycle (nothing is submitted).
+PREFLIGHT_MAX_ORDER_NOTIONAL_MULT = 3.0    # x equity — single-order ceiling
+PREFLIGHT_MAX_GROSS_NOTIONAL_MULT = 12.0   # x equity — total-batch ceiling
+PREFLIGHT_MAX_ORDER_COUNT = 120
+PREFLIGHT_MAX_PRICE_DEVIATION = 0.05       # limit_px vs mid sanity (price-construction bugs)
 TRADING_INTENT_HOUR_UTC = 0
 TRADING_INTENT_MINUTE_UTC = 1
 POSITION_CHECK_INTERVAL_HOURS = 1
 
-DRY_RUN = False
+def _env_flag(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Compute orders but never cancel/submit to the exchange (intents still logged).
+DRY_RUN = _env_flag("DRY_RUN", False)
+# Also compute + log the *other* sizing model to a side file for parallel
+# validation, without ever feeding it to the executor.
+SHADOW_SIZING = _env_flag("SHADOW_SIZING", False)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +126,20 @@ def sleep_until_next_tick(state):
     time.sleep(1)
 
 
+def _watchdog(threshold_s=1800):
+    import time
+    while True:
+        time.sleep(60)
+        try:
+            ts_ms = float(Path("state/heartbeat.ms").read_text())
+            age = time.time() - ts_ms / 1000
+            if age > threshold_s:
+                logger.error(f"[watchdog] heartbeat stale for {age:.0f}s — forcing exit")
+                os._exit(1)
+        except Exception:
+            pass
+
+
 # ── Live-trading helpers ───────────────────────────────────────────────────────
 
 def update_ltps():
@@ -143,21 +181,81 @@ def log_strategy_intent(
         intent_log["assets"][symbol]["model"]["target_weight"] = float(weights[i])
 
 
+def mvo_config_from_strategy(config: StrategyConfig) -> MVOConfig:
+    """Build the MVO core config from the production StrategyConfig."""
+    return MVOConfig(
+        sizing="vol_target",
+        gamma=config.mvo_gamma,
+        rf=config.mvo_rf,
+        kelly_fraction=config.mvo_kelly_fraction,
+        target_vol_daily=config.mvo_target_vol_daily,
+        trading_days=config.mvo_trading_days,
+        max_position_weight=config.mvo_max_position_weight,
+        lookback=config.mvo_lookback,
+        min_periods=config.mvo_min_periods,
+    )
+
+
+def log_strategy_intent_mvo(
+    intent_log: Dict[str, Any],
+    prices: pd.DataFrame,
+    mvo_intent: MVOIntent,
+    mvo_config: MVOConfig,
+):
+    mask = mvo_intent.mask
+    tradable = list(prices.columns.values[mask])
+    intent_log["universe"]["tradable"] = tradable
+    intent_log["universe"]["non_tradable"] = list(prices.columns.values[~mask])
+
+    for i, symbol in enumerate(tradable):
+        model = intent_log["assets"][symbol]["model"]
+        model["target_weight"] = float(mvo_intent.target_weight[i])
+        model["tangency_weight"] = float(mvo_intent.tangency_weight[i])
+        model["capped"] = bool(mvo_intent.capped[i])
+        model["risk_position"] = None  # risk-parity only
+
+    intent_log["sizing"].update({
+        "model": "mvo_max_sharpe",
+        "sizing_rule": "vol_target",
+        "target_vol_daily": mvo_config.target_vol_daily,
+        "target_vol_annual": mvo_config.target_vol_annual,
+        "trading_days": mvo_config.trading_days,
+        "max_position_weight": mvo_config.max_position_weight,
+        "gamma": mvo_config.gamma,
+        "applied_leverage": float(mvo_intent.leverage),
+        "expected_vol_annual": float(mvo_intent.expected_vol),
+        "gross_leverage": float(mvo_intent.gross),
+        "portfolio_mu": float(mvo_intent.portfolio_mu),
+    })
+
+
 def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_view, logger, intent_logger):
     t = prices.index[-1]
     mask = ~prices.loc[t].isna().values
-
-    strategy_intent = compute_strategy(
-        mu=mu[-1], vo=vo[-1], cor_matrix=cor.loc[t].values, mask=mask, config=config
-    )
-    log_strategy_intent(intent_log, prices, strategy_intent, config)
-
     tradable_symbols = prices.columns[mask]
-    conversion_factor = config.weight_multiplier / config.position_multiplier
-    target_weights = {
-        symbol: pos * conversion_factor
-        for symbol, pos in zip(tradable_symbols, strategy_intent.target_position)
-    }
+
+    if config.sizing_model == "mvo":
+        mvo_config = mvo_config_from_strategy(config)
+        mvo_intent = compute_strategy_mvo(
+            price_window=prices.loc[:t], mu_row=mu[-1], mask=mask, config=mvo_config
+        )
+        log_strategy_intent_mvo(intent_log, prices, mvo_intent, mvo_config)
+        target_weights = {
+            symbol: float(w)
+            for symbol, w in zip(tradable_symbols, mvo_intent.target_weight)
+        }
+    else:
+        strategy_intent = compute_strategy(
+            mu=mu[-1], vo=vo[-1], cor_matrix=cor.loc[t].values, mask=mask, config=config
+        )
+        log_strategy_intent(intent_log, prices, strategy_intent, config)
+        intent_log["sizing"]["model"] = "risk_parity"
+        conversion_factor = config.weight_multiplier / config.position_multiplier
+        target_weights = {
+            symbol: pos * conversion_factor
+            for symbol, pos in zip(tradable_symbols, strategy_intent.target_position)
+        }
+
     target_zeroes = {coin: 0 for coin in set(positions.keys()) - set(target_weights.keys())}
     intent_log["universe"]["holdings_outside_universe"] = list(target_zeroes.keys())
 
@@ -192,6 +290,33 @@ def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_vi
     return order_intentions
 
 
+def run_shadow_sizing(prices, mu, vo, cor, positions, ltps, base_intent, live_config,
+                      latest_view, logger, shadow_logger):
+    """Compute + log the *other* sizing model on the same inputs, to a side file.
+
+    Reuses run_live so the shadow record is a full intent (weights + would-be
+    order intentions vs the real book), but its return value is discarded and the
+    executor never reads ``shadow_logger``'s file — so no real-money path touches it.
+    """
+    shadow_model = "mvo" if live_config.sizing_model != "mvo" else "risk_parity"
+    shadow_config = replace(live_config, sizing_model=shadow_model)
+
+    # Deep-copy the pre-sizing base (same market/signal/risk/portfolio inputs);
+    # re-stamp meta provenance for the shadow strategy (keep run_id/git to join).
+    shadow_intent = copy.deepcopy(base_intent)
+    prov = strategy_registry.provenance(shadow_config)
+    shadow_intent["meta"]["strategy"] = prov["strategy"]
+    shadow_intent["meta"]["strategy_components"] = prov["strategy_components"]
+    shadow_intent["meta"]["config_hash"] = prov["config_hash"]
+
+    try:
+        run_live(prices, mu, vo, cor, positions, ltps, shadow_intent, shadow_config,
+                 latest_view, logger, shadow_logger)
+        logger.info(f"[shadow] logged {prov['strategy']} intent to side file")
+    except Exception:
+        logger.warning("[shadow] sizing failed — live path unaffected", exc_info=True)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
@@ -200,7 +325,7 @@ def main():
     from eth_account import Account
     from hyperliquid.exchange import Exchange
     from src.config import make_info, open_orders as hl_open_orders, HL_API_URL, PRIVATE_KEY, WALLET_ADDRESS, API_ADDRESS
-    from scripts.exchange_state import read_latest_exchange_state, run_exchange_state
+    from scripts.exchange_state import read_latest_exchange_state, run_exchange_state, get_account_equity
     from scripts.meta_data import get_hl_coins, read_latest_meta
     from scripts.run_fill_logger import main as run_fill_logger
     from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily
@@ -222,6 +347,8 @@ def main():
 
     intent_logger = IntentLogger(f"logs/intent_{TRADING_ENV}.jsonl")
     order_logger = OrderLogger(f"logs/orders_{TRADING_ENV}.jsonl")
+    # Parallel-validation sink: the executor never reads this file.
+    shadow_intent_logger = IntentLogger(f"logs/intent_{TRADING_ENV}_shadow.jsonl")
 
     state = load_state(STATE_PATH)
 
@@ -235,6 +362,8 @@ def main():
             logger.info("[meta] bootstrapped on first run")
         except Exception:
             logger.warning("[meta] bootstrap failed — fill logger may error until meta is available", exc_info=True)
+
+    threading.Thread(target=_watchdog, daemon=True).start()
 
     first_run = True
 
@@ -352,8 +481,11 @@ def main():
         # ── Trading intent task (daily) ────────────────────────────────────────
         if is_trading_intent_due(now, state):
             logger.info("[intent] computing trading intent")
-            intent = init_intent(mode="live", strategy_name="trend_v1.1", run_id=run_id)
             config = StrategyConfig()
+            prov = strategy_registry.provenance(config)
+            intent = init_intent(mode="live", strategy_name=prov["strategy"], run_id=run_id, provenance=prov)
+            logger.info(f"[intent] strategy={prov['strategy']} commit={prov['git_commit']} "
+                        f"dirty={prov['git_dirty']} config_hash={prov['config_hash']}")
             state = load_state(STATE_PATH)
             positions = get_state_positions(state)
             try:
@@ -384,8 +516,11 @@ def main():
 
             intent["universe"]["tradable"] = universe
             intent = initialise_asset_intent(intent, universe)
-            intent["portfolio"]["equity_usd"] = float(exchange_state["marginSummary"]["accountValue"])
-            intent["portfolio"]["equity_used_for_sizing"] = float(exchange_state["marginSummary"]["accountValue"])
+            # Source sizing equity from the unified-margin USDC balance (not
+            # marginSummary.accountValue) — keeps HEAD's fix over dev's version.
+            account_equity = get_account_equity(exchange_state)
+            intent["portfolio"]["equity_usd"] = account_equity
+            intent["portfolio"]["equity_used_for_sizing"] = account_equity
             intent["portfolio"]["maintenance_margin"] = exchange_state["crossMaintenanceMarginUsed"]
             intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state["marginSummary"]["totalNtlPos"]
             intent = add_ltp_to_intent(intent, latest_view)
@@ -424,7 +559,15 @@ def main():
                 }
             intent["risk_inputs"]["correlation_matrix"] = cor.loc[prices.index[-1]].to_dict()
 
+            # Snapshot the pre-sizing intent so the shadow runs off identical inputs.
+            shadow_base = copy.deepcopy(intent) if SHADOW_SIZING else None
+
             run_live(prices, mu, vo, cor, positions, ltps, intent, config, latest_view, logger, intent_logger)
+
+            if SHADOW_SIZING:
+                run_shadow_sizing(prices, mu, vo, cor, positions, ltps, shadow_base, config,
+                                  latest_view, logger, shadow_intent_logger)
+
             state["last_trading_intent_run_id"] = run_id
             state["universe"] = universe
             save_state(state, STATE_PATH)
@@ -435,80 +578,135 @@ def main():
 
         # ── Execution task ─────────────────────────────────────────────────────
         if is_trading_exec_due(now, state):
-            logger.info("[exec] running execution plan")
-            meta = read_latest_meta()
-            sz_decimals = {coin["name"]: coin["szDecimals"] for coin in meta["universe"]}
-            info = make_info()
-            wallet = Account.from_key(PRIVATE_KEY)
-            spot_meta = {"universe": [], "tokens": []} if TRADING_ENV == "testnet" else None
-            ex = Exchange(wallet=wallet, base_url=HL_API_URL, account_address=API_ADDRESS, spot_meta=spot_meta)
+            try:
+                logger.info("[exec] running execution plan")
+                meta = read_latest_meta()
+                sz_decimals = {coin["name"]: coin["szDecimals"] for coin in meta["universe"]}
+                info = make_info()
+                wallet = Account.from_key(PRIVATE_KEY)
+                spot_meta = {"universe": [], "tokens": []} if TRADING_ENV == "testnet" else None
+                ex = Exchange(wallet=wallet, base_url=HL_API_URL, account_address=API_ADDRESS, spot_meta=spot_meta)
 
-            intent_from_file = intent_logger.read_latest()
-            if not intent_from_file:
-                logger.warning("[exec] no intent file found, skipping execution until next intent run")
+                intent_from_file = intent_logger.read_latest()
+                if not intent_from_file:
+                    logger.warning("[exec] no intent file found, skipping execution until next intent run")
+                    state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
+                    save_state(state, STATE_PATH)
+                    continue
+                order_intentions = {
+                    asset: intent_from_file["assets"][asset]["order_intent"]
+                    for asset in intent_from_file["assets"]
+                }
+
+                ltps = update_ltps()
+                try:
+                    exchange_state = run_exchange_state()
+                    positions = {
+                        row["position"]["coin"]: float(row["position"]["szi"])
+                        for row in exchange_state["assetPositions"]
+                    }
+                except Exception:
+                    logger.warning("can't fetch live positions for execution plan, falling back to state file")
+                    positions = get_state_positions(state)
+
+                if not DRY_RUN:
+                    open_orders = hl_open_orders(info, WALLET_ADDRESS)
+                    if open_orders:
+                        cancels = [{"coin": o["coin"], "oid": o["oid"]} for o in open_orders]
+                        logger.debug(f"Cancel Requests: {cancels}")
+                        resp = ex.bulk_cancel(cancels)
+                        logger.debug(f"Cancel Response: {resp}")
+
+                orders = get_execution_plan(order_intentions, ltps, sz_decimals, logger, positions=positions)
+
+                # ── Pre-flight circuit breaker ───────────────────────────────
+                # Sanity-gate the batch before it reaches the exchange. On any
+                # violation, block the whole submission and retry next cycle.
+                equity = float(intent_from_file["portfolio"].get("equity_used_for_sizing") or 0)
+                if orders and equity > 0:
+                    preflight = preflight_check(
+                        orders, ltps,
+                        max_order_notional_usd=PREFLIGHT_MAX_ORDER_NOTIONAL_MULT * equity,
+                        max_gross_notional_usd=PREFLIGHT_MAX_GROSS_NOTIONAL_MULT * equity,
+                        max_order_count=PREFLIGHT_MAX_ORDER_COUNT,
+                        max_price_deviation=PREFLIGHT_MAX_PRICE_DEVIATION,
+                    )
+                    if not preflight.ok:
+                        for v in preflight.violations:
+                            logger.error(f"[exec] preflight BLOCKED: {v}")
+                        logger.error(
+                            f"[exec] circuit breaker tripped — skipping submission of "
+                            f"{len(orders)} orders this tick"
+                        )
+                        orders = []  # block all; existing flow records the tick and retries next cycle
+                elif orders:
+                    logger.warning("[exec] preflight skipped — equity unknown, can't size notional caps")
+
+                halted = False
+                if not DRY_RUN and orders:
+                    print(generate_readable_summary(orders, ltps))
+                    # Strip to the fields the exchange expects; keep the full dict for logging.
+                    wire_keys = ("coin", "is_buy", "sz", "limit_px", "order_type", "reduce_only")
+                    wire_orders = [{k: o[k] for k in wire_keys} for o in orders]
+                    response = ex.bulk_orders(wire_orders)
+                    if response.get("status") == "ok":
+                        all_statuses = response["response"]["data"]["statuses"]
+                        # HL returns top-level "ok" even when individual orders are
+                        # rejected ({"error": ...}); classify each status so rejections
+                        # (and their reason) are surfaced instead of counted as submitted.
+                        result = classify_order_responses(orders, all_statuses)
+                        if result.count_mismatch:
+                            logger.error(
+                                f"[exec] status count {len(all_statuses)} != order count "
+                                f"{len(orders)} — response may be misaligned: {response}"
+                            )
+                        for co in result.classified:
+                            order_logger.log_order_submission(
+                                run_id=run_id,
+                                exchange="hyperliquid",
+                                account=WALLET_ADDRESS,
+                                symbol=co.coin,
+                                side="buy" if co.order["is_buy"] else "sell",
+                                order_type="LIMIT",
+                                price=co.order["limit_px"],
+                                qty=co.order["sz"],
+                                target_qty=co.order.get("target_qty"),
+                                current_qty=co.order.get("current_qty"),
+                                delta=co.order.get("delta"),
+                                response={"response": {"data": {"statuses": [co.raw_status]}}},
+                            )
+                        for co in result.rejected:
+                            logger.error(f"[exec] order REJECTED [{co.status.value}] — {co.coin}: {co.error}")
+                        if result.rejected:
+                            logger.warning(
+                                f"[exec] {len(result.rejected)}/{len(orders)} orders rejected by exchange "
+                                f"(accepted {len(result.accepted)})"
+                            )
+                            # "Trading is halted." is a transient exchange-side condition;
+                            # flag it so we retry soon instead of waiting the full interval.
+                            halted = result.halted
+                        if result.accepted:
+                            logging.info(f"[exec] Rebalance triggered — {len(result.accepted)}/{len(orders)} orders accepted")
+                    else:
+                        logger.error(f"[exec] bulk submission failed (top-level): {response}")
+
+                open_orders = run_fill_logger()
+                state = load_state(STATE_PATH)
+                state["has_open_orders"] = bool(open_orders)
+                state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
+                if halted:
+                    # Backdate the exec gate so the next tick is due in ~HALT_RETRY_MINUTES
+                    # rather than the full interval — resume promptly when the halt lifts.
+                    retry_offset = dt.timedelta(minutes=TRADING_EXEC_INTERVAL_MINUTES - HALT_RETRY_MINUTES)
+                    state["last_trading_exec_ms"] = int((now - retry_offset).timestamp() * 1000)
+                    logger.warning(f"[exec] exchange halted — retrying in ~{HALT_RETRY_MINUTES} min")
+                else:
+                    state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
+                save_state(state, STATE_PATH)
+            except Exception:
+                logger.warning("[exec] failed", exc_info=True)
                 state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
                 save_state(state, STATE_PATH)
-                continue
-            order_intentions = {
-                asset: intent_from_file["assets"][asset]["order_intent"]
-                for asset in intent_from_file["assets"]
-            }
-
-            ltps = update_ltps()
-            try:
-                exchange_state = run_exchange_state()
-                positions = {
-                    row["position"]["coin"]: float(row["position"]["szi"])
-                    for row in exchange_state["assetPositions"]
-                }
-            except Exception:
-                logger.warning("can't fetch live positions for execution plan, falling back to state file")
-                positions = get_state_positions(state)
-
-            if not DRY_RUN:
-                open_orders = hl_open_orders(info, WALLET_ADDRESS)
-                if open_orders:
-                    cancels = [{"coin": o["coin"], "oid": o["oid"]} for o in open_orders]
-                    logger.debug(f"Cancel Requests: {cancels}")
-                    resp = ex.bulk_cancel(cancels)
-                    logger.debug(f"Cancel Response: {resp}")
-
-            orders = get_execution_plan(order_intentions, ltps, sz_decimals, logger, positions=positions)
-
-            if not DRY_RUN and orders:
-                print(generate_readable_summary(orders, ltps))
-                # Strip to the fields the exchange expects; keep the full dict for logging.
-                wire_keys = ("coin", "is_buy", "sz", "limit_px", "order_type", "reduce_only")
-                wire_orders = [{k: o[k] for k in wire_keys} for o in orders]
-                response = ex.bulk_orders(wire_orders)
-                if response.get("status") == "ok":
-                    all_statuses = response["response"]["data"]["statuses"]
-                    for i, status in enumerate(all_statuses):
-                        order_info = orders[i]
-                        order_logger.log_order_submission(
-                            run_id=run_id,
-                            exchange="hyperliquid",
-                            account=WALLET_ADDRESS,
-                            symbol=order_info["coin"],
-                            side="buy" if order_info["is_buy"] else "sell",
-                            order_type="LIMIT",
-                            price=order_info["limit_px"],
-                            qty=order_info["sz"],
-                            target_qty=order_info.get("target_qty"),
-                            current_qty=order_info.get("current_qty"),
-                            delta=order_info.get("delta"),
-                            response={"response": {"data": {"statuses": [status]}}},
-                        )
-                    logging.info(f"[exec] Rebalance triggered — {len(orders)} orders submitted")
-                else:
-                    print(f"Bulk submission failed: {response}")
-
-            open_orders = run_fill_logger()
-            state = load_state(STATE_PATH)
-            state["has_open_orders"] = bool(open_orders)
-            state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
-            state["last_trading_exec_ms"] = int(now.timestamp() * 1000)
-            save_state(state, STATE_PATH)
         elif first_run:
             last_ms = state.get("last_trading_exec_ms", 0)
             next_due = dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc) + dt.timedelta(minutes=TRADING_EXEC_INTERVAL_MINUTES)

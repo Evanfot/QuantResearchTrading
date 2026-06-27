@@ -29,13 +29,19 @@ def _init_exchange():
     exchange.load_markets()
 
 
-def get_symbol_start_time_dict(symbols: list[str]) -> dict[str, int]:
-    """Query DuckDB for the resume timestamp (ms) per symbol (read-only, opens/closes own connection)."""
+def get_symbol_start_time_dict(symbols: list[str], con=None) -> dict[str, int]:
+    """Query DuckDB for the resume timestamp (ms) per symbol.
+
+    Opens its own read-only connection by default; pass ``con`` to reuse an
+    existing connection (e.g. for tests against a temp DB).
+    """
     three_months_ago = datetime.now(timezone.utc) - timedelta(days=730)
     default_ms = int(three_months_ago.timestamp() * 1000)
 
+    owns_con = con is None
     try:
-        con = duckdb.connect(DB_PATH, read_only=True)
+        if owns_con:
+            con = duckdb.connect(DB_PATH, read_only=True)
         try:
             rows = con.execute(f"""
                 SELECT symbol, MAX(datetime)
@@ -44,7 +50,8 @@ def get_symbol_start_time_dict(symbols: list[str]) -> dict[str, int]:
                 GROUP BY symbol
             """).fetchall()
         finally:
-            con.close()
+            if owns_con:
+                con.close()
         known = {sym: int(pd.Timestamp(ts).timestamp() * 1000) + 1
                  for sym, ts in rows if ts is not None}
     except Exception:
@@ -183,15 +190,21 @@ def _run_async(coro):
         asyncio.run(coro)
 
 
-def run_ohlcv_dl(symbols: list[str] | None = None):
+def run_ohlcv_dl(symbols: list[str] | None = None, con=None):
+    """Download OHLCV for ``symbols`` into DuckDB.
+
+    Opens its own connection to ``DB_PATH`` by default; pass ``con`` to inject an
+    existing connection (e.g. a temp DB in tests). An injected connection is left
+    open for the caller to close.
+    """
     _init_exchange()
 
     if symbols is None:
         symbols = [s for s in exchange.symbols if s.endswith("/USDC:USDC")]
 
-    start_times = get_symbol_start_time_dict(symbols)
-
-    con = duckdb.connect(DB_PATH)
+    owns_con = con is None
+    if owns_con:
+        con = duckdb.connect(DB_PATH)
     try:
         con.execute(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -205,9 +218,11 @@ def run_ohlcv_dl(symbols: list[str] | None = None):
             downloaded_at TIMESTAMP,
             PRIMARY KEY(symbol, datetime)
         )""")
+        start_times = get_symbol_start_time_dict(symbols, con=con)
         _run_async(dl(start_times, con))
     finally:
-        con.close()
+        if owns_con:
+            con.close()
 
 
 if __name__ == "__main__":

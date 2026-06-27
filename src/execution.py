@@ -1,7 +1,118 @@
 """Order intention and execution plan logic."""
 
+import json
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
+
+
+class OrderStatus(Enum):
+    """Canonical order outcome vocabulary shared across placement, fills and cancels.
+
+    The placement classifier (``classify_order_responses``) only emits the subset a
+    Hyperliquid ``bulk_orders`` response can actually return — FILLED, OPEN, the
+    error sub-types, REJECTED and UNKNOWN. PARTIAL and CANCELLED are reserved for
+    the fills-reconciliation and cancel-response parsers respectively.
+    """
+
+    FILLED = "FILLED"
+    OPEN = "OPEN"                          # resting on the book
+    PARTIAL = "PARTIAL"                    # reserved: from fills reconciliation
+    CANCELLED = "CANCELLED"                # reserved: from bulk_cancel parser
+    REJECTED = "REJECTED"                  # error with no recognised signature
+    TRADING_HALTED = "TRADING_HALTED"
+    INSUFFICIENT_MARGIN = "INSUFFICIENT_MARGIN"
+    MIN_NOTIONAL = "MIN_NOTIONAL"
+    UNKNOWN = "UNKNOWN"                    # unparseable status shape
+
+
+# Error-string signatures, matched as case-insensitive substrings because HL appends
+# an ``asset=N`` suffix (e.g. "Insufficient margin to place order. asset=2"). Order
+# matters only if signatures overlap — these don't.
+_ERROR_SIGNATURES: Tuple[Tuple[str, OrderStatus], ...] = (
+    ("halt", OrderStatus.TRADING_HALTED),
+    ("insufficient margin", OrderStatus.INSUFFICIENT_MARGIN),
+    ("minimum value", OrderStatus.MIN_NOTIONAL),
+)
+
+
+def classify_status(status: object) -> Tuple[OrderStatus, Optional[str]]:
+    """Classify a single Hyperliquid ``bulk_orders`` status object.
+
+    Returns ``(OrderStatus, error_message_or_None)``. A status is one of
+    ``{"filled": {...}}``, ``{"resting": {...}}`` or ``{"error": "..."}``; anything
+    else is treated as UNKNOWN rather than silently assumed good.
+    """
+    if not isinstance(status, dict):
+        return OrderStatus.UNKNOWN, str(status)
+    if "filled" in status:
+        return OrderStatus.FILLED, None
+    if "resting" in status:
+        return OrderStatus.OPEN, None
+    if "error" in status:
+        msg = str(status["error"])
+        low = msg.lower()
+        for needle, mapped in _ERROR_SIGNATURES:
+            if needle in low:
+                return mapped, msg
+        return OrderStatus.REJECTED, msg
+    return OrderStatus.UNKNOWN, json.dumps(status)
+
+
+@dataclass
+class ClassifiedOrder:
+    """A submitted order paired with its classified exchange response."""
+
+    order: dict             # the submitted order dict (coin, is_buy, sz, limit_px, ...)
+    raw_status: object      # the raw HL status object for this order
+    status: OrderStatus
+    error: Optional[str]
+
+    @property
+    def coin(self) -> str:
+        return self.order.get("coin")
+
+    @property
+    def accepted(self) -> bool:
+        """Accepted = reached the book (resting) or filled. UNKNOWN is never accepted."""
+        return self.status in (OrderStatus.FILLED, OrderStatus.OPEN)
+
+
+@dataclass
+class ExecutionResult:
+    """Classified outcome of one ``bulk_orders`` submission."""
+
+    classified: List[ClassifiedOrder]
+    count_mismatch: bool = False  # True if statuses count != orders count
+
+    @property
+    def accepted(self) -> List[ClassifiedOrder]:
+        return [c for c in self.classified if c.accepted]
+
+    @property
+    def rejected(self) -> List[ClassifiedOrder]:
+        return [c for c in self.classified if not c.accepted]
+
+    @property
+    def halted(self) -> bool:
+        return any(c.status is OrderStatus.TRADING_HALTED for c in self.classified)
+
+
+def classify_order_responses(orders: list, statuses: list) -> ExecutionResult:
+    """Pair each submitted order with its HL status and classify the outcome.
+
+    HL returns one status per order in index order. If the counts disagree (a
+    structural surprise the old code silently mis-indexed), classify the overlap
+    and flag ``count_mismatch`` so the caller can treat it conservatively.
+    """
+    classified = []
+    for order, status in zip(orders, statuses):
+        st, err = classify_status(status)
+        classified.append(ClassifiedOrder(order=order, raw_status=status, status=st, error=err))
+    return ExecutionResult(classified=classified, count_mismatch=len(orders) != len(statuses))
 
 
 def get_order_intention(
@@ -89,6 +200,65 @@ def get_execution_plan(
         })
 
     return exchange_orders
+
+
+@dataclass
+class PreflightResult:
+    """Outcome of the pre-submission sanity gate."""
+
+    ok: bool
+    violations: List[str]
+
+
+def preflight_check(
+    orders: list,
+    ltps: dict,
+    *,
+    max_order_notional_usd: float,
+    max_gross_notional_usd: float,
+    max_order_count: int,
+    max_price_deviation: float = 0.05,
+) -> PreflightResult:
+    """Sanity-gate a batch of orders before submission.
+
+    Catches the fat-finger / stale-price / runaway-batch classes of error that
+    unit tests can't anticipate: a decimal or units bug inflating one order, a
+    limit price wildly off the mid it was derived from, or a systemic bug
+    inflating the whole batch. Returns ``ok=False`` with human-readable
+    violations; the caller blocks the *entire* submission on any violation
+    rather than letting a suspect batch reach the exchange.
+
+    Caps are passed in (the caller derives the notional ones from live equity) so
+    this stays pure and testable.
+    """
+    violations: List[str] = []
+
+    if len(orders) > max_order_count:
+        violations.append(f"order count {len(orders)} > cap {max_order_count}")
+
+    gross = 0.0
+    for o in orders:
+        coin = o["coin"]
+        px = o["limit_px"]
+        notional = abs(o["sz"]) * px
+        gross += notional
+        if notional > max_order_notional_usd:
+            violations.append(
+                f"{coin} order notional ${notional:,.0f} > per-order cap ${max_order_notional_usd:,.0f}"
+            )
+        ltp = ltps.get(coin, 0)
+        if not ltp:
+            violations.append(f"{coin} has no reference price for sanity check")
+        elif abs(px - ltp) / ltp > max_price_deviation:
+            violations.append(
+                f"{coin} limit_px {px:g} deviates {abs(px - ltp) / ltp * 100:.1f}% "
+                f"from mid {ltp:g} (cap {max_price_deviation * 100:.0f}%)"
+            )
+
+    if gross > max_gross_notional_usd:
+        violations.append(f"gross order notional ${gross:,.0f} > batch cap ${max_gross_notional_usd:,.0f}")
+
+    return PreflightResult(ok=not violations, violations=violations)
 
 
 def generate_readable_summary(orders, ltps):
