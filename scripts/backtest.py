@@ -15,14 +15,13 @@ import logging
 import pandas as pd
 import datetime as dt
 import numpy as np
-import duckdb
 from dotenv import load_dotenv
 
 from scripts.meta_data import get_hl_coins
 from scripts.mkt_cap_data import get_latest_market_cap
 from src.backtester.full_backtest import run_backtest, StrategyConfig
 from src.signal import ewmac, breakout, scaled_bollinger, alpha006, alpha014, alpha020
-from src.data import get_hyperliquid_trading_universe, db_path, get_ohlcv, get_final_pricing, load_ohlcv_for_alphas
+from src.data import get_hyperliquid_trading_universe, get_ohlcv, get_final_pricing, load_ohlcv_for_alphas
 # %%
 START_DATE = "2025-01-01"  # set to None to use all available data
 
@@ -31,10 +30,9 @@ top = get_latest_market_cap()
 hl = get_hl_coins()
 universe, symbol_index = get_hyperliquid_trading_universe(top, hl)
 # Get pricing and add to intent
-conn = duckdb.connect(db_path)
-hyperliquid_prices = get_ohlcv(conn)
+prices_all = get_ohlcv()
 latest_view = pd.read_csv('data/snapshots/mids.csv', index_col=0)
-prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
+prices, returns_adj = get_final_pricing(prices_all, universe, latest_view)
 config = StrategyConfig()
 ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
 breakout_forecast = breakout(prices, config.breakout_window)

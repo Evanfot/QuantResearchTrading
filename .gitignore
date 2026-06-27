@@ -5,6 +5,7 @@
 .env
 .env.testnet
 logs/
+logs-testnet/
 config.json
 *.log
 .git/
@@ -257,3 +258,5 @@ __pycache__/
 # Optional: virtual env
 .venv/
 venv/
+scripts/sync_cache.sh
+docs/decisions/

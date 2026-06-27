@@ -62,7 +62,7 @@ def get_hl_coins():
 def run_exchange_state():
     exchange_state = fetch_exchange_state()
     path = store_exchange_state(exchange_state)
-    logger.info(f"Saved exchange_state snapshot → {path}")
+    logger.debug(f"Saved exchange_state snapshot → {path}")
     return exchange_state
 
 if __name__ == "__main__":

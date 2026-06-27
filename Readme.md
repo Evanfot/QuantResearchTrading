@@ -54,6 +54,17 @@ docker-compose --profile testnet up
 
 The default `docker-compose up` (no profile) only starts mainnet services.
 
+### Docker command safety reference
+
+| Command | Safe? | Effect |
+|---|---|---|
+| `docker compose build trader-testnet` | ✅ | Rebuilds only testnet image |
+| `docker compose up -d trader-testnet` | ✅ | Uses existing testnet image |
+| `docker compose restart trader-testnet` | ✅ | No rebuild |
+| `docker compose build trader` | ⚠️ | Rebuilds mainnet image from current branch |
+| `docker compose build` | ❌ | Rebuilds all images |
+| `docker compose up --build` | ❌ | May rebuild services from current branch |
+
 ### Manually triggering tasks
 
 Edit the state file (`state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json`) and restart.
@@ -66,6 +77,17 @@ Edit the state file (`state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.jso
 | Market cap update | `last_mkt_cap_run_ms` | `0` |
 | Position check | `last_position_check_ms` | `0` |
 | Exchange meta | `last_meta_run_ms` | `0` |
+
+### Running backtests locally
+
+Backtests read from `data/cache/daily_ohlcv.parquet`, which is built nightly on the server by the `cache-builder` service. To get the latest data on your laptop before running a backtest:
+
+```bash
+# Copy scripts/sync_cache.sh.example → scripts/sync_cache.sh, fill in your server details
+scripts/sync_cache.sh
+```
+
+`sync_cache.sh` is gitignored (contains your server address). The `.example` file documents the required format.
 
 ### Backtest output:
 - Generated 2026/05/09 using scripts.backtest

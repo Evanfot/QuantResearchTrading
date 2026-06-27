@@ -7,29 +7,28 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
-import duckdb
 import numpy as np
 import pandas as pd
 
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
 from src.backtester.full_backtest_mvo import MVOConfig, MVOIntent, compute_strategy_mvo
 from src.strategy import registry as strategy_registry
-from src.data import db_path, get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
+from src.data import get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
 from src.execution import classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
 from src.loggers.order_logger import OrderLogger
 from src.signal import alpha006, alpha014, alpha020, breakout, ewmac, scaled_bollinger
 from src.state.strategy_state import get_state_positions, load_state, save_state
-from src.universe import get_latest_market_cap, get_top_marketcap, get_universe, store_market_cap
+from src.universe import UNIVERSE_SIZE, get_latest_market_cap, get_top_marketcap, get_universe, store_market_cap
 
 # ── Scheduling constants ───────────────────────────────────────────────────────
-DATA_HOUR_UTC = 0
-DATA_MINUTE_UTC = 1
+DATA_HOUR_UTC = 23
+DATA_MINUTE_UTC = 45
 MKT_CAP_HOUR_UTC = 0
 MKT_CAP_MINUTE_UTC = 5
 META_HOUR_UTC = 23
-META_MINUTE_UTC = 45
+META_MINUTE_UTC = 40
 TRADING_EXEC_HOUR_UTC = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
 HALT_RETRY_MINUTES = 5  # retry cadence after a transient "Trading is halted." rejection
@@ -62,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 # ── Scheduling predicates ──────────────────────────────────────────────────────
 
+
+
 def is_day_open_due(now, state):
     last_ms = state.get("last_day_open_ms")
     if last_ms is None:
@@ -79,23 +80,10 @@ def is_position_check_due(now, state):
 
 
 def is_data_due(now, state):
-    last_ms = state.get("last_data_run_ms")
-    if last_ms:
-        last_run = dt.datetime.fromtimestamp(last_ms / 1000, tz=dt.timezone.utc)
-        return now.date() > last_run.date() and now.hour >= DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
-    # Fresh state (e.g. new testnet env) — query the DB for the latest row date before
-    # forcing a download. OHLCV data is market data shared across environments.
-    try:
-        db = Path("data/pricing/ohlcv_data.duckdb")
-        if db.exists():
-            conn = duckdb.connect(str(db), read_only=True)
-            max_date = conn.execute("SELECT MAX(datetime) FROM hyperliquid_1d").fetchone()[0]
-            conn.close()
-            if max_date and max_date.date() >= (now - dt.timedelta(days=1)).date():
-                return False
-    except Exception:
-        pass
-    return True
+    if state.get("last_data_run_ms") is None:
+        return True
+    last_run = dt.datetime.fromtimestamp(state["last_data_run_ms"] / 1000, tz=dt.timezone.utc)
+    return now.date() > last_run.date() and now.hour >= DATA_HOUR_UTC and now.minute >= DATA_MINUTE_UTC
 
 
 def is_meta_due(now, state):
@@ -340,7 +328,7 @@ def main():
     from scripts.exchange_state import read_latest_exchange_state, run_exchange_state, get_account_equity
     from scripts.meta_data import get_hl_coins, read_latest_meta
     from scripts.run_fill_logger import main as run_fill_logger
-    from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily, update_latest_view
+    from src.ingestion.hyperliquid import run_ohlcv_dl, update_daily
 
     # ── Setup ──────────────────────────────────────────────────────────────────
     root = Path().resolve()
@@ -447,17 +435,17 @@ def main():
             next_due = dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc) + dt.timedelta(hours=POSITION_CHECK_INTERVAL_HOURS)
             logger.info(f"[position_check] not due, next at {next_due.isoformat()}")
 
-        # ── Data task (daily at 00:01 UTC) ─────────────────────────────────────
+        # ── Data task (nightly at 23:45 UTC) ──────────────────────────────────
+        # 1. Download HL OHLCV (for coins not in Binance data); skipped on testnet.
+        # 2. build() reads daily_closes.parquet (Binance) + HL DuckDB → daily_ohlcv.parquet.
+        # Today's live prices are appended in-memory at intent time via get_final_pricing().
         if is_data_due(now, state):
-            logger.info("[data] downloading OHLCV data")
-            open_orders = run_fill_logger()
-            state = load_state(STATE_PATH)
-            state["has_open_orders"] = bool(open_orders)
-            state["fills_logged_at_ms"] = int(now.timestamp() * 1000)
-            save_state(state, STATE_PATH)
-            run_ohlcv_dl()
-            update_daily()
-            update_latest_view()
+            logger.info("[data] rebuilding OHLCV cache from Binance + HL data")
+            if TRADING_ENV != "testnet":
+                run_ohlcv_dl()
+                update_daily()
+            from scripts.build_daily_cache import build as _build_daily_cache
+            _build_daily_cache()
             state["last_data_run_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
             logger.info("[data] complete")
@@ -510,17 +498,26 @@ def main():
             top = get_latest_market_cap()
             hl = get_hl_coins()
             universe, symbol_index = get_universe(top, hl, state.get("universe"))
+            logger.info(
+                f"[intent] tradable universe: {len(universe)}/{UNIVERSE_SIZE} "
+                f"(top-{UNIVERSE_SIZE} by market cap, narrowed by exchange listing; "
+                f"size varies as listings change)"
+            )
 
-            conn = duckdb.connect(db_path)
-            hyperliquid_prices = get_ohlcv(conn)
+            prices_all = get_ohlcv()
+            _missing = [c for c in universe if c not in prices_all.columns]
+            if _missing:
+                logger.warning(f"[intent] {len(_missing)} coins absent from price cache, dropping from universe: {_missing}")
+                universe = [c for c in universe if c in prices_all.columns]
+                symbol_index = {sym: i for i, sym in enumerate(universe)}
             ltps = update_ltps()
             latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
-            prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
-            tradable = list(prices.columns)
-            symbol_index = {s: i for i, s in enumerate(tradable)}
+            prices, returns_adj = get_final_pricing(prices_all, universe, latest_view)
 
-            intent["universe"]["tradable"] = tradable
-            intent = initialise_asset_intent(intent, tradable)
+            intent["universe"]["tradable"] = universe
+            intent = initialise_asset_intent(intent, universe)
+            # Source sizing equity from the unified-margin USDC balance (not
+            # marginSummary.accountValue) — keeps HEAD's fix over dev's version.
             account_equity = get_account_equity(exchange_state)
             intent["portfolio"]["equity_usd"] = account_equity
             intent["portfolio"]["equity_used_for_sizing"] = account_equity
@@ -548,7 +545,7 @@ def main():
             vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
             cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
 
-            for symbol in tradable:
+            for symbol in universe:
                 intent["assets"][symbol]["model"]["vol_1d"] = float(vo[-1, symbol_index[symbol]])
                 intent["assets"][symbol]["model"]["signal"] = {
                     "mu": float(mu[-1, symbol_index[symbol]]),
@@ -648,7 +645,10 @@ def main():
                 halted = False
                 if not DRY_RUN and orders:
                     print(generate_readable_summary(orders, ltps))
-                    response = ex.bulk_orders(orders)
+                    # Strip to the fields the exchange expects; keep the full dict for logging.
+                    wire_keys = ("coin", "is_buy", "sz", "limit_px", "order_type", "reduce_only")
+                    wire_orders = [{k: o[k] for k in wire_keys} for o in orders]
+                    response = ex.bulk_orders(wire_orders)
                     if response.get("status") == "ok":
                         all_statuses = response["response"]["data"]["statuses"]
                         # HL returns top-level "ok" even when individual orders are
@@ -670,6 +670,9 @@ def main():
                                 order_type="LIMIT",
                                 price=co.order["limit_px"],
                                 qty=co.order["sz"],
+                                target_qty=co.order.get("target_qty"),
+                                current_qty=co.order.get("current_qty"),
+                                delta=co.order.get("delta"),
                                 response={"response": {"data": {"statuses": [co.raw_status]}}},
                             )
                         for co in result.rejected:
