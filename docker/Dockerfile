@@ -19,6 +19,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code only
 COPY src/ ./src/
 COPY scripts/ ./scripts/
+COPY config/ ./config/          # strategy registry TOML — read at runtime by provenance
+
+# Stamp the build commit so intent.meta.git_commit is populated in prod
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
 
 # Default entrypoint
 CMD ["python", "-m", "src.main"]
