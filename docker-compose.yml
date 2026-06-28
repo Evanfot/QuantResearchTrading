@@ -11,14 +11,16 @@ services:
     env_file:
       - .env
     environment:
-      BINANCE_DATA_ROOT: /app
+      # build_daily_cache reads $BINANCE_KLINES_DIR/klines/processed/daily_closes.parquet
+      BINANCE_KLINES_DIR: /app/binance-klines
       SHADOW_SIZING: ${SHADOW_SIZING:-false}
       DRY_RUN: ${DRY_RUN:-false}
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
       - ./data:/app/data
-      - binance-klines:/app/klines
+      # read-only bind-mount of the binance-klines producer's data dir (same as testnet)
+      - ~/projects/binance-klines:/app/binance-klines:ro
     networks:
       - binance-net
     command: python -m src.main
@@ -33,12 +35,12 @@ services:
     env_file:
       - .env
     environment:
-      BINANCE_DATA_ROOT: /app
+      BINANCE_KLINES_DIR: /app/binance-klines
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
       - ./data:/app/data
-      - binance-klines:/app/klines
+      - ~/projects/binance-klines:/app/binance-klines:ro
     networks:
       - binance-net
     ports:
@@ -56,10 +58,10 @@ services:
     env_file:
       - .env
     environment:
-      BINANCE_DATA_ROOT: /app
+      BINANCE_KLINES_DIR: /app/binance-klines
     volumes:
       - ./data:/app/data
-      - binance-klines:/app/klines
+      - ~/projects/binance-klines:/app/binance-klines:ro
     networks:
       - binance-net
     command: python scripts/build_daily_cache.py
@@ -109,10 +111,6 @@ services:
     ports:
       - "8051:8050"
     command: python -m src.dashboard.app
-
-volumes:
-  binance-klines:
-    external: true
 
 networks:
   binance-net:
