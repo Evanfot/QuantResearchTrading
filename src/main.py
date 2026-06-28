@@ -13,7 +13,7 @@ import pandas as pd
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
 from src.backtester.full_backtest_mvo import MVOConfig, MVOIntent, compute_strategy_mvo
 from src.strategy import registry as strategy_registry
-from src.data import get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
+from src.data import get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, latest_is_provisional, load_ohlcv_for_alphas
 from src.execution import classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
@@ -505,6 +505,38 @@ def main():
             )
 
             prices_all = get_ohlcv()
+
+            # ── Data freshness guard ─────────────────────────────────────────
+            # Refuse to size on a stale/gapped series. The provisional close (from
+            # the binance-klines live buffer, ~23:40 UTC) and the later official bar
+            # both land before this decision; if the most recent expected day isn't
+            # in the cache yet (dead stream / rebuild unfinished), skip and retry
+            # rather than trade on yesterday's data.
+            latest_cache_date = prices_all.index.max().date()
+            expected_date = (now - dt.timedelta(days=1)).date()
+            if latest_cache_date < expected_date:
+                _stale_key = now.strftime("%Y%m%dT%H%M")
+                if state.get("intent_stale_logged_min") != _stale_key:
+                    logger.warning(
+                        f"[intent] data stale: latest cached close {latest_cache_date} < "
+                        f"expected {expected_date} — skipping, will retry next tick"
+                    )
+                    state["intent_stale_logged_min"] = _stale_key
+                    save_state(state, STATE_PATH)
+                # Don't mark the intent done; fall through to the normal tick sleep
+                # (not `continue` alone, which would busy-loop) and retry.
+                if first_run:
+                    first_run = False
+                sleep_until_next_tick(state)
+                continue
+            _is_prov = latest_is_provisional()
+            intent["meta"]["provisional_close"] = _is_prov
+            if _is_prov:
+                logger.info(
+                    f"[intent] using PROVISIONAL close for {latest_cache_date} "
+                    f"(official Binance bar not yet published)"
+                )
+
             _missing = [c for c in universe if c not in prices_all.columns]
             if _missing:
                 logger.warning(f"[intent] {len(_missing)} coins absent from price cache, dropping from universe: {_missing}")

@@ -64,6 +64,8 @@ def _load_binance_closes() -> pd.DataFrame:
 
     # Map Binance names (BTCUSDT) → HL names (BTC)
     df["symbol"] = df["symbol"].str.replace(r"(USDT|BUSD)$", "", regex=True)
+    if "provisional" not in df.columns:
+        df["provisional"] = False  # cache predates the producer's provisional flag
     return df.dropna(subset=["symbol", "close"])
 
 
@@ -140,6 +142,10 @@ def build() -> None:
         .sort_values(["date", "symbol"])
         .reset_index(drop=True)
     )
+    # HL-fallback rows carry no flag → final; normalise so the column is a clean bool.
+    if "provisional" not in df.columns:
+        df["provisional"] = False
+    df["provisional"] = df["provisional"].fillna(False).astype(bool)
     _write_atomic(df, CACHE_PATH)
 
     print(f"\nWritten → {CACHE_PATH}")
