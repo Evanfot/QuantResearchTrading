@@ -52,6 +52,24 @@ def get_ohlcv() -> pd.DataFrame:
     return result
 
 
+def latest_is_provisional() -> bool | None:
+    """Whether the most recent cached daily bar is a provisional (live-buffer) close.
+
+    The binance-klines producer flags `provisional=True` for a close synthesised from
+    the live 1m buffer before Binance publishes the official daily file. Returns None
+    if the cache predates the flag (no `provisional` column). Best-effort: never raises.
+    """
+    try:
+        import pyarrow.parquet as _pq
+        if "provisional" not in _pq.read_schema(_CACHE_PATH).names:
+            return None
+        df = pd.read_parquet(_CACHE_PATH, columns=["date", "provisional"])
+        latest = pd.to_datetime(df["date"]).max()
+        return bool(df.loc[pd.to_datetime(df["date"]) == latest, "provisional"].fillna(False).any())
+    except Exception:
+        return None
+
+
 def get_final_pricing(
     prices_all: pd.DataFrame,
     universe: list[str],
