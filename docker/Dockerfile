@@ -24,7 +24,8 @@ COPY docker/hl_symbol_map.json /usr/local/lib/python3.11/site-packages/hl_symbol
 # Copy source code only
 COPY src/ ./src/
 COPY scripts/ ./scripts/
-COPY config/ ./config/          # strategy registry TOML — read at runtime by provenance
+# strategy registry TOML — read at runtime by provenance
+COPY config/ ./config/
 
 # Stamp the build commit so intent.meta.git_commit is populated in prod
 ARG GIT_COMMIT=unknown
