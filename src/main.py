@@ -345,6 +345,12 @@ def main():
     from src.config import TRADING_ENV
     STATE_PATH = Path(f"state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json")
 
+    # Ensure data subdirs exist on a cold start (fresh data volume). Most modules
+    # create their own dir, but snapshots (day_open/mids csv) and pricing (HL
+    # DuckDB) do not, and would otherwise crash the day-open and 23:45 data tasks.
+    for _d in ("data/snapshots", "data/pricing", "data/cache"):
+        Path(_d).mkdir(parents=True, exist_ok=True)
+
     intent_logger = IntentLogger(f"logs/intent_{TRADING_ENV}.jsonl")
     order_logger = OrderLogger(f"logs/orders_{TRADING_ENV}.jsonl")
     # Parallel-validation sink: the executor never reads this file.
