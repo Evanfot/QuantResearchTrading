@@ -504,27 +504,33 @@ def main():
                 f"size varies as listings change)"
             )
 
-            prices_all = get_ohlcv()
-
-            # ── Data freshness guard ─────────────────────────────────────────
-            # Refuse to size on a stale/gapped series. The provisional close (from
-            # the binance-klines live buffer, ~23:40 UTC) and the later official bar
-            # both land before this decision; if the most recent expected day isn't
-            # in the cache yet (dead stream / rebuild unfinished), skip and retry
-            # rather than trade on yesterday's data.
-            latest_cache_date = prices_all.index.max().date()
-            expected_date = (now - dt.timedelta(days=1)).date()
-            if latest_cache_date < expected_date:
+            # ── Data availability + freshness guard ──────────────────────────
+            # The cache may be missing (cold start before the nightly build) or
+            # stale (dead producer / unfinished rebuild). In every case skip and
+            # retry on the next tick rather than crash the process or size on a
+            # stale/gapped series. The provisional close (binance-klines live
+            # buffer, ~23:40 UTC) + the later official bar both land before this
+            # decision, so a current cache should hold the expected most-recent day.
+            _intent_skip_reason = None
+            try:
+                prices_all = get_ohlcv()
+                latest_cache_date = prices_all.index.max().date()
+                expected_date = (now - dt.timedelta(days=1)).date()
+                if latest_cache_date < expected_date:
+                    _intent_skip_reason = (
+                        f"data stale: latest cached close {latest_cache_date} < "
+                        f"expected {expected_date}"
+                    )
+            except (FileNotFoundError, RuntimeError) as e:
+                _intent_skip_reason = f"cache not ready ({e})"
+            if _intent_skip_reason is not None:
                 _stale_key = now.strftime("%Y%m%dT%H%M")
                 if state.get("intent_stale_logged_min") != _stale_key:
-                    logger.warning(
-                        f"[intent] data stale: latest cached close {latest_cache_date} < "
-                        f"expected {expected_date} — skipping, will retry next tick"
-                    )
+                    logger.warning(f"[intent] {_intent_skip_reason} — skipping, will retry next tick")
                     state["intent_stale_logged_min"] = _stale_key
                     save_state(state, STATE_PATH)
-                # Don't mark the intent done; fall through to the normal tick sleep
-                # (not `continue` alone, which would busy-loop) and retry.
+                # Don't mark the intent done; take the normal tick sleep (not a bare
+                # `continue`, which would busy-loop) and retry.
                 if first_run:
                     first_run = False
                 sleep_until_next_tick(state)
