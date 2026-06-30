@@ -126,7 +126,16 @@ def sleep_until_next_tick(state):
     time.sleep(1)
 
 
-def _watchdog(threshold_s=1800):
+# The heartbeat is written once per loop iteration, and the nightly data task
+# (run_ohlcv_dl over the full universe) legitimately blocks one iteration for many
+# minutes — longer under Binance 429 backoff. The threshold must exceed that worst
+# case or the watchdog kills a *working* download (which then never finishes →
+# restart loop). 1h covers a slow download; a genuinely hung process still trips it,
+# and the data-freshness guard is the trading-safety backstop. Env-tunable.
+WATCHDOG_THRESHOLD_S = int(os.getenv("WATCHDOG_THRESHOLD_S", "3600"))
+
+
+def _watchdog(threshold_s: int = WATCHDOG_THRESHOLD_S):
     import time
     while True:
         time.sleep(60)
