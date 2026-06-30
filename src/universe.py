@@ -39,7 +39,7 @@ STABLE = {"USDT", "USDC", "DAI", "USDD", "FDUSD", "TUSD", "DEI", "USDP", "GUSD",
 EXCLUDED = {"PAXG"}
 
 MKT_CAP_DIR = Path("data/mkt_cap")
-MKT_CAP_DIR.mkdir(exist_ok=True)
+MKT_CAP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── Market-cap data ───────────────────────────────────────────────────────────
