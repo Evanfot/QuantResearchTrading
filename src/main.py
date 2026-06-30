@@ -495,136 +495,139 @@ def main():
 
         # ── Trading intent task (daily) ────────────────────────────────────────
         if is_trading_intent_due(now, state):
-            logger.info("[intent] computing trading intent")
-            config = StrategyConfig()
-            prov = strategy_registry.provenance(config)
-            intent = init_intent(mode="live", strategy_name=prov["strategy"], run_id=run_id, provenance=prov)
-            logger.info(f"[intent] strategy={prov['strategy']} commit={prov['git_commit']} "
-                        f"dirty={prov['git_dirty']} config_hash={prov['config_hash']}")
-            state = load_state(STATE_PATH)
-            positions = get_state_positions(state)
             try:
-                exchange_state = run_exchange_state()
-            except Exception:
-                logger.warning("can't fetch exchange state for intent, using latest cached")
-                exchange_state = read_latest_exchange_state()
+                logger.info("[intent] computing trading intent")
+                config = StrategyConfig()
+                prov = strategy_registry.provenance(config)
+                intent = init_intent(mode="live", strategy_name=prov["strategy"], run_id=run_id, provenance=prov)
+                logger.info(f"[intent] strategy={prov['strategy']} commit={prov['git_commit']} "
+                            f"dirty={prov['git_dirty']} config_hash={prov['config_hash']}")
+                state = load_state(STATE_PATH)
+                positions = get_state_positions(state)
+                try:
+                    exchange_state = run_exchange_state()
+                except Exception:
+                    logger.warning("can't fetch exchange state for intent, using latest cached")
+                    exchange_state = read_latest_exchange_state()
 
-            meta = read_latest_meta()
-            top = get_latest_market_cap()
-            hl = get_hl_coins()
-            universe, symbol_index = get_universe(top, hl, state.get("universe"))
-            logger.info(
-                f"[intent] tradable universe: {len(universe)}/{UNIVERSE_SIZE} "
-                f"(top-{UNIVERSE_SIZE} by market cap, narrowed by exchange listing; "
-                f"size varies as listings change)"
-            )
-
-            # ── Data availability + freshness guard ──────────────────────────
-            # The cache may be missing (cold start before the nightly build) or
-            # stale (dead producer / unfinished rebuild). In every case skip and
-            # retry on the next tick rather than crash the process or size on a
-            # stale/gapped series. The provisional close (binance-klines live
-            # buffer, ~23:40 UTC) + the later official bar both land before this
-            # decision, so a current cache should hold the expected most-recent day.
-            _intent_skip_reason = None
-            try:
-                prices_all = get_ohlcv()
-                latest_cache_date = prices_all.index.max().date()
-                expected_date = (now - dt.timedelta(days=1)).date()
-                if latest_cache_date < expected_date:
-                    _intent_skip_reason = (
-                        f"data stale: latest cached close {latest_cache_date} < "
-                        f"expected {expected_date}"
-                    )
-            except (FileNotFoundError, RuntimeError) as e:
-                _intent_skip_reason = f"cache not ready ({e})"
-            if _intent_skip_reason is not None:
-                _stale_key = now.strftime("%Y%m%dT%H%M")
-                if state.get("intent_stale_logged_min") != _stale_key:
-                    logger.warning(f"[intent] {_intent_skip_reason} — skipping, will retry next tick")
-                    state["intent_stale_logged_min"] = _stale_key
-                    save_state(state, STATE_PATH)
-                # Don't mark the intent done; take the normal tick sleep (not a bare
-                # `continue`, which would busy-loop) and retry.
-                if first_run:
-                    first_run = False
-                sleep_until_next_tick(state)
-                continue
-            _is_prov = latest_is_provisional()
-            intent["meta"]["provisional_close"] = _is_prov
-            if _is_prov:
+                meta = read_latest_meta()
+                top = get_latest_market_cap()
+                hl = get_hl_coins()
+                universe, symbol_index = get_universe(top, hl, state.get("universe"))
                 logger.info(
-                    f"[intent] using PROVISIONAL close for {latest_cache_date} "
-                    f"(official Binance bar not yet published)"
+                    f"[intent] tradable universe: {len(universe)}/{UNIVERSE_SIZE} "
+                    f"(top-{UNIVERSE_SIZE} by market cap, narrowed by exchange listing; "
+                    f"size varies as listings change)"
                 )
 
-            _missing = [c for c in universe if c not in prices_all.columns]
-            if _missing:
-                logger.warning(f"[intent] {len(_missing)} coins absent from price cache, dropping from universe: {_missing}")
-                universe = [c for c in universe if c in prices_all.columns]
-                symbol_index = {sym: i for i, sym in enumerate(universe)}
-            ltps = update_ltps()
-            latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
-            prices, returns_adj = get_final_pricing(prices_all, universe, latest_view)
+                # ── Data availability + freshness guard ──────────────────────────
+                # The cache may be missing (cold start before the nightly build) or
+                # stale (dead producer / unfinished rebuild). In every case skip and
+                # retry on the next tick rather than crash the process or size on a
+                # stale/gapped series. The provisional close (binance-klines live
+                # buffer, ~23:40 UTC) + the later official bar both land before this
+                # decision, so a current cache should hold the expected most-recent day.
+                _intent_skip_reason = None
+                try:
+                    prices_all = get_ohlcv()
+                    latest_cache_date = prices_all.index.max().date()
+                    expected_date = (now - dt.timedelta(days=1)).date()
+                    if latest_cache_date < expected_date:
+                        _intent_skip_reason = (
+                            f"data stale: latest cached close {latest_cache_date} < "
+                            f"expected {expected_date}"
+                        )
+                except (FileNotFoundError, RuntimeError) as e:
+                    _intent_skip_reason = f"cache not ready ({e})"
+                if _intent_skip_reason is not None:
+                    _stale_key = now.strftime("%Y%m%dT%H%M")
+                    if state.get("intent_stale_logged_min") != _stale_key:
+                        logger.warning(f"[intent] {_intent_skip_reason} — skipping, will retry next tick")
+                        state["intent_stale_logged_min"] = _stale_key
+                        save_state(state, STATE_PATH)
+                    # Don't mark the intent done; take the normal tick sleep (not a bare
+                    # `continue`, which would busy-loop) and retry.
+                    if first_run:
+                        first_run = False
+                    sleep_until_next_tick(state)
+                    continue
+                _is_prov = latest_is_provisional()
+                intent["meta"]["provisional_close"] = _is_prov
+                if _is_prov:
+                    logger.info(
+                        f"[intent] using PROVISIONAL close for {latest_cache_date} "
+                        f"(official Binance bar not yet published)"
+                    )
 
-            intent["universe"]["tradable"] = universe
-            intent = initialise_asset_intent(intent, universe)
-            # Source sizing equity from the unified-margin USDC balance (not
-            # marginSummary.accountValue) — keeps HEAD's fix over dev's version.
-            account_equity = get_account_equity(exchange_state)
-            intent["portfolio"]["equity_usd"] = account_equity
-            intent["portfolio"]["equity_used_for_sizing"] = account_equity
-            intent["portfolio"]["maintenance_margin"] = exchange_state["crossMaintenanceMarginUsed"]
-            intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state["marginSummary"]["totalNtlPos"]
-            intent = add_ltp_to_intent(intent, latest_view)
+                _missing = [c for c in universe if c not in prices_all.columns]
+                if _missing:
+                    logger.warning(f"[intent] {len(_missing)} coins absent from price cache, dropping from universe: {_missing}")
+                    universe = [c for c in universe if c in prices_all.columns]
+                    symbol_index = {sym: i for i, sym in enumerate(universe)}
+                ltps = update_ltps()
+                latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
+                prices, returns_adj = get_final_pricing(prices_all, universe, latest_view)
 
-            ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
-            breakout_forecast = breakout(prices, config.breakout_window)
-            bollinger_forecast = scaled_bollinger(prices, param=config.bollinger_window, scalar=1)
+                intent["universe"]["tradable"] = universe
+                intent = initialise_asset_intent(intent, universe)
+                # Source sizing equity from the unified-margin USDC balance (not
+                # marginSummary.accountValue) — keeps HEAD's fix over dev's version.
+                account_equity = get_account_equity(exchange_state)
+                intent["portfolio"]["equity_usd"] = account_equity
+                intent["portfolio"]["equity_used_for_sizing"] = account_equity
+                intent["portfolio"]["maintenance_margin"] = exchange_state["crossMaintenanceMarginUsed"]
+                intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state["marginSummary"]["totalNtlPos"]
+                intent = add_ltp_to_intent(intent, latest_view)
 
-            o, h, l, c_alpha, v = load_ohlcv_for_alphas(universe)
-            o        = o.reindex(index=prices.index, columns=prices.columns)
-            h        = h.reindex(index=prices.index, columns=prices.columns)
-            l        = l.reindex(index=prices.index, columns=prices.columns)
-            v        = v.reindex(index=prices.index, columns=prices.columns)
-            c_alpha  = c_alpha.reindex(index=prices.index, columns=prices.columns)
-            r_alpha  = np.log(c_alpha).diff()
+                ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
+                breakout_forecast = breakout(prices, config.breakout_window)
+                bollinger_forecast = scaled_bollinger(prices, param=config.bollinger_window, scalar=1)
 
-            alpha006_forecast = alpha006(o, v)
-            alpha014_forecast = alpha014(o, v, r_alpha)
-            alpha020_forecast = alpha020(o, h, l, c_alpha)
+                o, h, l, c_alpha, v = load_ohlcv_for_alphas(universe)
+                o        = o.reindex(index=prices.index, columns=prices.columns)
+                h        = h.reindex(index=prices.index, columns=prices.columns)
+                l        = l.reindex(index=prices.index, columns=prices.columns)
+                v        = v.reindex(index=prices.index, columns=prices.columns)
+                c_alpha  = c_alpha.reindex(index=prices.index, columns=prices.columns)
+                r_alpha  = np.log(c_alpha).diff()
 
-            mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast, alpha006_forecast, alpha014_forecast, alpha020_forecast], axis=0)
-            vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
-            cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
+                alpha006_forecast = alpha006(o, v)
+                alpha014_forecast = alpha014(o, v, r_alpha)
+                alpha020_forecast = alpha020(o, h, l, c_alpha)
 
-            for symbol in universe:
-                intent["assets"][symbol]["model"]["vol_1d"] = float(vo[-1, symbol_index[symbol]])
-                intent["assets"][symbol]["model"]["signal"] = {
-                    "mu": float(mu[-1, symbol_index[symbol]]),
-                    "sub_signals": {
-                        "ewmac": float(ewmac_forecast[-1, symbol_index[symbol]]),
-                        "breakout": float(breakout_forecast[-1, symbol_index[symbol]]),
-                        "bollinger": float(bollinger_forecast[-1, symbol_index[symbol]]),
-                        "alpha014": float(alpha014_forecast[-1, symbol_index[symbol]]),
-                        "alpha020": float(alpha020_forecast[-1, symbol_index[symbol]]),
-                    },
-                }
-            intent["risk_inputs"]["correlation_matrix"] = cor.loc[prices.index[-1]].to_dict()
+                mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast, alpha006_forecast, alpha014_forecast, alpha020_forecast], axis=0)
+                vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
+                cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
 
-            # Snapshot the pre-sizing intent so the shadow runs off identical inputs.
-            shadow_base = copy.deepcopy(intent) if SHADOW_SIZING else None
+                for symbol in universe:
+                    intent["assets"][symbol]["model"]["vol_1d"] = float(vo[-1, symbol_index[symbol]])
+                    intent["assets"][symbol]["model"]["signal"] = {
+                        "mu": float(mu[-1, symbol_index[symbol]]),
+                        "sub_signals": {
+                            "ewmac": float(ewmac_forecast[-1, symbol_index[symbol]]),
+                            "breakout": float(breakout_forecast[-1, symbol_index[symbol]]),
+                            "bollinger": float(bollinger_forecast[-1, symbol_index[symbol]]),
+                            "alpha014": float(alpha014_forecast[-1, symbol_index[symbol]]),
+                            "alpha020": float(alpha020_forecast[-1, symbol_index[symbol]]),
+                        },
+                    }
+                intent["risk_inputs"]["correlation_matrix"] = cor.loc[prices.index[-1]].to_dict()
 
-            run_live(prices, mu, vo, cor, positions, ltps, intent, config, latest_view, logger, intent_logger)
+                # Snapshot the pre-sizing intent so the shadow runs off identical inputs.
+                shadow_base = copy.deepcopy(intent) if SHADOW_SIZING else None
 
-            if SHADOW_SIZING:
-                run_shadow_sizing(prices, mu, vo, cor, positions, ltps, shadow_base, config,
-                                  latest_view, logger, shadow_intent_logger)
+                run_live(prices, mu, vo, cor, positions, ltps, intent, config, latest_view, logger, intent_logger)
 
-            state["last_trading_intent_run_id"] = run_id
-            state["universe"] = universe
-            save_state(state, STATE_PATH)
-            logger.info(f"[intent] complete, run_id={run_id}, universe size={len(universe)}")
+                if SHADOW_SIZING:
+                    run_shadow_sizing(prices, mu, vo, cor, positions, ltps, shadow_base, config,
+                                      latest_view, logger, shadow_intent_logger)
+
+                state["last_trading_intent_run_id"] = run_id
+                state["universe"] = universe
+                save_state(state, STATE_PATH)
+                logger.info(f"[intent] complete, run_id={run_id}, universe size={len(universe)}")
+            except Exception:
+                logger.warning("[intent] failed", exc_info=True)
         elif first_run:
             last_id = state.get("last_trading_intent_run_id", "never")
             logger.info(f"[intent] not due (last: {last_id}, scheduled: {TRADING_INTENT_HOUR_UTC:02d}:{TRADING_INTENT_MINUTE_UTC:02d} UTC)")
