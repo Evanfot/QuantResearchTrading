@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Pull the latest daily OHLCV cache from the server before running backtests.
+# Copy this file to sync_cache.sh, fill in your details, then chmod +x sync_cache.sh
+set -euo pipefail
+
+SERVER="<user>@<host>"
+REMOTE_PATH="/path/to/trend_trader/data/cache/daily_ohlcv.parquet"
+LOCAL_PATH="$(dirname "$0")/../data/cache/daily_ohlcv.parquet"
+
+mkdir -p "$(dirname "$LOCAL_PATH")"
+
+echo "Syncing daily_ohlcv.parquet from $SERVER …"
+rsync -avz "$SERVER:$REMOTE_PATH" "$LOCAL_PATH"
+echo "Done — $(date -u '+%Y-%m-%d %H:%M UTC')"

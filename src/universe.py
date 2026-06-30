@@ -1,12 +1,27 @@
 """
 Universe management: market-cap data and coin selection with buffer-zone hysteresis.
 
-Selection rules:
-  - Initial / no prior universe: top UNIVERSE_SIZE eligible coins
-  - Additions: a coin must reach rank <= ADD_THRESHOLD to enter
-  - Removals:  a coin must fall to rank >  REMOVE_THRESHOLD to exit
+Two-stage design:
 
-Eligibility: must be listed on Hyperliquid, not a stablecoin, not excluded.
+  1. Eligible Universe — the top UNIVERSE_SIZE cryptocurrencies by market cap.
+     A coin's rank is its TRUE market-cap rank (rank 1 = largest), computed
+     before any tradability filtering. Stablecoins and EXCLUDED tokens are not
+     trend-tradable cryptocurrencies and are removed before ranking, so they
+     never consume a rank slot.
+
+  2. Tradable Universe — the Eligible Universe intersected with the tradability
+     filters: listed on the exchange (Hyperliquid), plus any liquidity and
+     history / data-quality requirements applied downstream.
+
+Selection rules (all rank thresholds refer to TRUE market-cap rank):
+  - Initial / no prior universe: top UNIVERSE_SIZE eligible coins that are tradable.
+  - Additions: a coin must reach rank <= ADD_THRESHOLD (and be tradable) to enter.
+  - Removals:  a coin must fall to rank >  REMOVE_THRESHOLD (or become untradable) to exit.
+
+Crucially, the universe is NEVER backfilled with assets ranked beyond the top N
+just because fewer than N are tradable. If only 30 of the top 50 are tradable,
+the Tradable Universe has 30 members — assets ranked 51+ cannot enter. The
+number of tradable assets therefore varies through time.
 """
 import datetime as dt
 import pandas as pd
@@ -24,7 +39,7 @@ STABLE = {"USDT", "USDC", "DAI", "USDD", "FDUSD", "TUSD", "DEI", "USDP", "GUSD",
 EXCLUDED = {"PAXG"}
 
 MKT_CAP_DIR = Path("data/mkt_cap")
-MKT_CAP_DIR.mkdir(exist_ok=True)
+MKT_CAP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── Market-cap data ───────────────────────────────────────────────────────────
@@ -57,11 +72,18 @@ def get_latest_market_cap() -> pd.DataFrame:
 
 # ── Universe selection ────────────────────────────────────────────────────────
 
-def _eligible_ranked(top_market_cap: pd.DataFrame, hl_universe: set) -> list[str]:
-    """Return eligible coins in descending market-cap order (rank 1 = largest).
+def _eligible_ranked(top_market_cap: pd.DataFrame) -> list[str]:
+    """Return eligible cryptocurrencies in descending market-cap order.
 
-    Eligibility: listed on Hyperliquid, not a stablecoin, not in EXCLUDED,
-    no duplicates (keeps first occurrence by market-cap rank).
+    Position in the returned list is the coin's TRUE market-cap rank
+    (index 0 = rank 1 = largest). 'Eligible' means a genuine trend-tradable
+    cryptocurrency: not a stablecoin, not in EXCLUDED, de-duplicated (first
+    occurrence by market-cap rank wins).
+
+    Tradability filters (exchange listing, liquidity, history/data-quality) are
+    deliberately NOT applied here. Applying them before ranking is what caused
+    lower-cap assets to back-fill the universe: a coin's rank must reflect its
+    real market-cap standing, not its position within an already-filtered list.
     """
     seen: set[str] = set()
     eligible: list[str] = []
@@ -69,9 +91,8 @@ def _eligible_ranked(top_market_cap: pd.DataFrame, hl_universe: set) -> list[str
         symbol = coin["symbol"].upper()
         if symbol in EXCLUDED or symbol in STABLE or symbol in seen:
             continue
-        if symbol in hl_universe:
-            eligible.append(symbol)
-            seen.add(symbol)
+        eligible.append(symbol)
+        seen.add(symbol)
     return eligible
 
 
@@ -80,7 +101,15 @@ def get_universe(
     hl_universe: set,
     current_universe: list | None = None,
 ) -> tuple[list[str], dict[str, int]]:
-    """Return (universe, symbol_index) applying buffer-zone hysteresis.
+    """Return (tradable_universe, symbol_index) applying buffer-zone hysteresis.
+
+    Implements the two-stage Eligible -> Tradable design:
+      * Eligible Universe = top UNIVERSE_SIZE coins by TRUE market-cap rank.
+      * Tradable Universe = Eligible AND tradable (listed on the exchange, plus
+        any liquidity / history filters applied downstream).
+
+    The universe is never expanded past rank UNIVERSE_SIZE to compensate for
+    untradable coins, so its size may be < UNIVERSE_SIZE and may vary over time.
 
     Args:
         top_market_cap:   Latest market-cap DataFrame (from get_latest_market_cap).
@@ -89,23 +118,38 @@ def get_universe(
                           for first-run initialisation.
 
     Returns:
-        universe:     Ordered list of coin symbols.
+        universe:     Ordered list of tradable coin symbols.
         symbol_index: {symbol: position_in_universe}.
     """
-    eligible = _eligible_ranked(top_market_cap, hl_universe)
-    rank_of = {sym: i + 1 for i, sym in enumerate(eligible)}  # 1-based rank
+    eligible = _eligible_ranked(top_market_cap)
+    rank_of = {sym: i + 1 for i, sym in enumerate(eligible)}  # 1-based TRUE market-cap rank
+
+    def tradable(sym: str) -> bool:
+        """Tradability filters layered on top of the Eligible Universe.
+
+        Currently the only exchange-level filter is being listed on Hyperliquid.
+        Liquidity and history / data-quality filters are applied downstream
+        (e.g. dropping coins absent from the price cache); they further narrow
+        this set but can never widen it.
+        """
+        return sym in hl_universe
 
     if not current_universe:
-        # First run — seed with top UNIVERSE_SIZE
-        universe = eligible[:UNIVERSE_SIZE]
+        # First run — Tradable Universe = (top UNIVERSE_SIZE eligible) AND tradable.
+        # Note the slice happens BEFORE the tradability filter, so coins ranked
+        # past UNIVERSE_SIZE can never back-fill; the result may hold < N coins.
+        universe = [s for s in eligible[:UNIVERSE_SIZE] if tradable(s)]
     else:
-        # Retain coins still within the removal threshold
+        # Retain coins still within the removal threshold AND still tradable.
         retained = [s for s in current_universe
-                    if rank_of.get(s, REMOVE_THRESHOLD + 1) <= REMOVE_THRESHOLD]
+                    if rank_of.get(s, REMOVE_THRESHOLD + 1) <= REMOVE_THRESHOLD
+                    and tradable(s)]
 
-        # Add coins newly inside the addition threshold
+        # Add tradable coins newly inside the addition threshold. The slice is on
+        # market-cap rank, so additions are drawn only from the top ADD_THRESHOLD.
         retained_set = set(retained)
-        additions = [s for s in eligible[:ADD_THRESHOLD] if s not in retained_set]
+        additions = [s for s in eligible[:ADD_THRESHOLD]
+                     if tradable(s) and s not in retained_set]
 
         universe = retained + additions
 

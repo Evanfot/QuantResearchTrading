@@ -3,46 +3,89 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    image: trend_trader:mainnet
     container_name: trader
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # build_daily_cache reads $BINANCE_KLINES_DIR/klines/processed/daily_closes.parquet
+      BINANCE_KLINES_DIR: /app/binance-klines
+      SHADOW_SIZING: ${SHADOW_SIZING:-false}
+      DRY_RUN: ${DRY_RUN:-false}
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
       - ./data:/app/data
+      # read-only bind-mount of the binance-klines producer's data dir (same as testnet)
+      - ~/projects/binance-klines:/app/binance-klines:ro
+    networks:
+      - binance-net
     command: python -m src.main
 
   dashboard:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    image: trend_trader:mainnet
     container_name: dashboard
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      BINANCE_KLINES_DIR: /app/binance-klines
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
       - ./data:/app/data
+      - ~/projects/binance-klines:/app/binance-klines:ro
+    networks:
+      - binance-net
     ports:
       - "8050:8050"
     command: python -m src.dashboard.app
+
+  cache-builder:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: trend_trader:cache-builder
+    container_name: cache-builder
+    restart: no
+    cpus: 1.5
+    env_file:
+      - .env
+    environment:
+      BINANCE_KLINES_DIR: /app/binance-klines
+    volumes:
+      - ./data:/app/data
+      - ~/projects/binance-klines:/app/binance-klines:ro
+    networks:
+      - binance-net
+    command: python scripts/build_daily_cache.py
 
   trader-testnet:
     profiles: [testnet]
     build:
       context: .
       dockerfile: docker/Dockerfile
+    image: trend_trader:testnet
     container_name: trader-testnet
     restart: unless-stopped
     env_file:
       - .env
       - .env.testnet
+    environment:
+      BINANCE_KLINES_DIR: /app/binance-klines
     volumes:
       - ./logs-testnet:/app/logs
       - ./state:/app/state
       - ./data:/app/data
+      - ~/projects/binance-klines:/app/binance-klines:ro
+    networks:
+      - binance-net
     command: python -m src.main
 
   dashboard-testnet:
@@ -50,15 +93,66 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    image: trend_trader:testnet
     container_name: dashboard-testnet
     restart: unless-stopped
     env_file:
       - .env
       - .env.testnet
+    environment:
+      BINANCE_KLINES_DIR: /app/binance-klines
     volumes:
       - ./logs-testnet:/app/logs
       - ./state:/app/state
       - ./data:/app/data
+      - ~/projects/binance-klines:/app/binance-klines:ro
+    networks:
+      - binance-net
     ports:
       - "8051:8050"
     command: python -m src.dashboard.app
+
+  # ── Shadow observer (dev) ──────────────────────────────────────────────────
+  # Watch dev's RP + MVO sizing in parallel with the live mainnet `trader`
+  # WITHOUT touching it. Fully isolated: its own logs/state/data dirs, DRY_RUN
+  # (never submits or cancels orders), SHADOW_SIZING (logs both models). It reads
+  # the real mainnet account read-only for positions/equity and computes from the
+  # binance-klines cache it builds in its own ./data-dev.
+  #
+  # Start before ~23:40 UTC so its nightly meta(23:40)+data(23:45) tasks bootstrap
+  # ./data-dev; shadow sizes land at 00:01 UTC in:
+  #   logs-dev/intent_mainnet.jsonl         (primary: risk_parity)
+  #   logs-dev/intent_mainnet_shadow.jsonl  (shadow:  mvo)
+  #
+  #   docker compose --profile shadow build trader-dev
+  #   docker compose --profile shadow up -d trader-dev
+  #   docker compose --profile shadow logs -f trader-dev
+  trader-dev:
+    profiles: [shadow]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    image: trend_trader:dev
+    container_name: trader-dev
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BINANCE_KLINES_DIR: /app/binance-klines
+      DRY_RUN: "true"          # never submits/cancels orders — observer only
+      SHADOW_SIZING: "true"    # log both risk_parity (primary) and mvo (shadow)
+    volumes:
+      # Isolated from the live trader — shares nothing it owns.
+      - ./logs-dev:/app/logs
+      - ./state-dev:/app/state
+      - ./data-dev:/app/data
+      - ~/projects/binance-klines:/app/binance-klines:ro
+    networks:
+      - binance-net
+    command: python -m src.main
+
+networks:
+  binance-net:
+    external: true

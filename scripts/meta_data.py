@@ -9,7 +9,7 @@ from pathlib import Path
 from src.config import HL_API_URL, TRADING_ENV
 
 META_DIR = Path(f"data/hyperliquid_meta_{TRADING_ENV}")
-META_DIR.mkdir(exist_ok=True)
+META_DIR.mkdir(parents=True, exist_ok=True)
 
 def fetch_meta():
     url = f"{HL_API_URL}/info"

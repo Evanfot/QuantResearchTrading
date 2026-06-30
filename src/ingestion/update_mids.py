@@ -97,6 +97,7 @@ def insert_into_duckdb(db_path, mids):
 
 def run_update_mids():
     logfile = Path(f"{db_dir}/logs/mids_cron.log")
+    logfile.parent.mkdir(parents=True, exist_ok=True)  # may not exist on a fresh data dir
     info = make_info()
     mids = get_all_ltps(info)
     init_duckdb_table(db_path)

@@ -77,3 +77,30 @@ def test_force_close_small_position(mock_context):
     assert len(orders) == 1
     assert orders[0]["sz"] == 0.002
     assert orders[0]["is_buy"] is False
+
+
+def test_sub10_after_rounding_is_dropped(mock_context):
+    """MIN_NOTIONAL leak: an order whose value clears $10 on the un-rounded delta but
+    falls below $10 once size is rounded to szDecimals must be dropped (HL rejects it).
+    """
+    ltps = {"ENA": 9.70}
+    sz_decimals = {"ENA": 0}                       # whole units → rounding shaves a lot
+    # 1.04 * 9.70 = $10.09 passes the pre-rounding floor, but rounds to 1 unit = $9.70
+    order_intentions = {"ENA": {"target": 1.04, "current": 0}}
+
+    orders = get_execution_plan(order_intentions, ltps, sz_decimals, mock_context["logger"])
+
+    assert orders == [], f"sub-$10 rounded order should be dropped, got {orders}"
+
+
+def test_above10_after_rounding_is_kept(mock_context):
+    """An order still worth ≥ $10 after rounding is kept."""
+    ltps = {"ENA": 9.70}
+    sz_decimals = {"ENA": 0}
+    order_intentions = {"ENA": {"target": 3.0, "current": 0}}   # 3 × $9.70 = $29.10
+
+    orders = get_execution_plan(order_intentions, ltps, sz_decimals, mock_context["logger"])
+
+    assert len(orders) == 1
+    assert orders[0]["coin"] == "ENA"
+    assert orders[0]["sz"] == 3

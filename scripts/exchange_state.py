@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 from src.config import make_info, WALLET_ADDRESS, TRADING_ENV
 
 exchange_state_DIR = Path(f"data/hyperliquid_exchange_state_{TRADING_ENV}")
-exchange_state_DIR.mkdir(exist_ok=True)
+exchange_state_DIR.mkdir(parents=True, exist_ok=True)
 address = WALLET_ADDRESS
 
 def fetch_exchange_state():
@@ -62,7 +62,7 @@ def get_hl_coins():
 def run_exchange_state():
     exchange_state = fetch_exchange_state()
     path = store_exchange_state(exchange_state)
-    logger.info(f"Saved exchange_state snapshot → {path}")
+    logger.debug(f"Saved exchange_state snapshot → {path}")
     return exchange_state
 
 if __name__ == "__main__":

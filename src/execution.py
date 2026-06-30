@@ -186,6 +186,18 @@ def get_execution_plan(
         precision = max(0, MAX_PRECISION - sz_dec)
         clean_px = round(float(f"{adj_px:.5g}"), precision)
 
+        # Min-notional floor on the ACTUAL order (rounded size × limit price). The
+        # earlier dollar_delta check uses the un-rounded delta, so an order can pass
+        # it yet fall below $10 once `clean_sz` is rounded down to szDecimals — which
+        # HL then rejects (MIN_NOTIONAL). Re-check here and skip rather than send a
+        # doomed order. (Flatten-to-zero orders, target_qty == 0, are left alone.)
+        if target_qty != 0 and clean_sz * clean_px < 10:
+            logger.debug(
+                f"[exec] {coin} skipped: order notional ${clean_sz * clean_px:.2f} "
+                f"< $10 after rounding (sz={clean_sz}, px={clean_px})"
+            )
+            continue
+
         exchange_orders.append({
             "coin": coin,
             "is_buy": side.upper() == "BUY",
@@ -193,6 +205,10 @@ def get_execution_plan(
             "limit_px": clean_px,
             "order_type": {"limit": {"tif": "Gtc"}},
             "reduce_only": False,
+            # intended-trade context (post dust-adjust, pre-rounding) for logging/attribution
+            "target_qty": target_qty,
+            "current_qty": current_qty,
+            "delta": delta,
         })
 
     return exchange_orders
