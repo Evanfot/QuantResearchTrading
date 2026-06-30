@@ -37,10 +37,18 @@ _DAILY_CLOSES_PATH = _BINANCE_KLINES_DIR / "klines" / "processed" / "daily_close
 
 
 def _hl_universe() -> set[str]:
-    meta_dir = ROOT / "data" / "hyperliquid_meta"
-    latest = sorted(meta_dir.glob("meta_*.json"))[-1]
-    with open(latest) as f:
-        return {x["name"].upper() for x in json.load(f)["universe"]}
+    # meta_data.py writes the env-suffixed dir (hyperliquid_meta_<env>); fall back to
+    # the legacy non-suffixed dir for older data volumes. Missing meta → no HL
+    # fallback (Binance-only) rather than crashing the whole build with IndexError.
+    env = os.environ.get("TRADING_ENV", "mainnet").lower()
+    for meta_dir in (ROOT / "data" / f"hyperliquid_meta_{env}",
+                     ROOT / "data" / "hyperliquid_meta"):
+        metas = sorted(meta_dir.glob("meta_*.json"))
+        if metas:
+            with open(metas[-1]) as f:
+                return {x["name"].upper() for x in json.load(f)["universe"]}
+    print("HL: no meta file found — building Binance-only (no HL fallback)", flush=True)
+    return set()
 
 
 def _load_binance_closes() -> pd.DataFrame:
