@@ -411,7 +411,11 @@ def main():
             hyperliquid_prices = get_ohlcv(conn)
             ltps = update_ltps()
             latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
-            prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
+            # Decide on the last SETTLED daily close, not today's live mid. Appending the
+            # mid made the signal terminal a partial intraday bar and silently zeroed the
+            # alphas (no OHLCV for today) — inconsistent with the close-based backtest.
+            # Today's mid is still used for execution pricing/sizing (ltps / latest_view).
+            prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view, append_today=False)
             tradable = list(prices.columns)
             symbol_index = {s: i for i, s in enumerate(tradable)}
 
