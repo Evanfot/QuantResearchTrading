@@ -25,25 +25,16 @@ def get_ohlcv(conn):
     return df.pivot(index="datetime", columns="symbol", values="close")
 
 
-def get_final_pricing(hyperliquid_prices, universe, latest_view, append_today: bool = True):
+def get_final_pricing(hyperliquid_prices, universe, latest_view):
     hype_universe = [k + "/USDC:USDC" for k in universe]
     hype_universe = [s for s in hype_universe if s in hyperliquid_prices.columns]
     prices = hyperliquid_prices[hype_universe].copy(deep=True)
     prices.columns = prices.columns.str.replace("/USDC:USDC", "")
-    # Restrict to coins that have a live mid regardless of append_today: this is what
-    # gates the tradable universe on having a price to execute against downstream.
     available = [c for c in prices.columns if c in latest_view.index]
     prices = prices[available]
-    if append_today:
-        # Append today's intraday mid as the terminal row so signals can react same-day.
-        # But the mid is a PARTIAL bar, not a settled close, and today has no OHLCV — so
-        # the alphas blank out on that row (reindex -> NaN -> 0), a train/serve gap vs the
-        # close-based backtest. Callers that want the decision made on the last SETTLED
-        # close pass append_today=False; the mid is still used for execution pricing/sizing
-        # (ltps / latest_view) elsewhere, so nothing is lost there.
-        prices.loc[
-            dt.datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
-        ] = latest_view.loc[available, "mid"].astype("float")
+    prices.loc[
+        dt.datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+    ] = latest_view.loc[available, "mid"].astype("float")
     returns = np.log(prices).diff()
     returns_adj = (returns / returns.ewm(com=_VOLA_COM, min_periods=120).std()).clip(
         -_WINSOR, +_WINSOR
