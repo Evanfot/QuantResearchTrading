@@ -31,11 +31,11 @@ REFRESH_SECONDS = 30
 # Scheduling constants — must mirror src/main.py
 # ---------------------------------------------------------------------------
 DATA_HOUR_UTC               = 0
-DATA_MINUTE_UTC             = 1
+DATA_MINUTE_UTC             = 10
 MKT_CAP_HOUR_UTC            = 0
 MKT_CAP_MINUTE_UTC          = 5
 TRADING_INTENT_HOUR_UTC     = 0
-TRADING_INTENT_MINUTE_UTC   = 1
+TRADING_INTENT_MINUTE_UTC   = 12
 TRADING_EXEC_HOUR_UTC       = 2
 TRADING_EXEC_INTERVAL_MINUTES = 30
 POSITION_CHECK_INTERVAL_HOURS = 1

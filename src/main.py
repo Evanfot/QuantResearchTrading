@@ -23,8 +23,13 @@ from src.state.strategy_state import get_state_positions, load_state, save_state
 from src.universe import UNIVERSE_SIZE, get_latest_market_cap, get_top_marketcap, get_universe, store_market_cap
 
 # ── Scheduling constants ───────────────────────────────────────────────────────
-DATA_HOUR_UTC = 23
-DATA_MINUTE_UTC = 45
+# Data/build runs at 00:10 UTC (not the prior 23:45): the binance-klines stream
+# writes today's *provisional* daily close to daily_closes.parquet at ~23:58, so a
+# 23:45 build missed the just-closed bar entirely (it landed at 00:00 with a NaN
+# trailing edge → NaN mu). 00:10 also lets main's 00:01 hyperliquid_ohlcv update
+# finish first. Intent follows at 00:12, once the cache is rebuilt.
+DATA_HOUR_UTC = 0
+DATA_MINUTE_UTC = 10
 MKT_CAP_HOUR_UTC = 0
 MKT_CAP_MINUTE_UTC = 5
 META_HOUR_UTC = 23
@@ -43,7 +48,7 @@ PREFLIGHT_MAX_GROSS_NOTIONAL_MULT = 12.0   # x equity — total-batch ceiling
 PREFLIGHT_MAX_ORDER_COUNT = 120
 PREFLIGHT_MAX_PRICE_DEVIATION = 0.05       # limit_px vs mid sanity (price-construction bugs)
 TRADING_INTENT_HOUR_UTC = 0
-TRADING_INTENT_MINUTE_UTC = 1
+TRADING_INTENT_MINUTE_UTC = 12  # after the 00:10 data/build so intent reads the fresh cache
 POSITION_CHECK_INTERVAL_HOURS = 1
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -356,7 +361,7 @@ def main():
 
     # Ensure data subdirs exist on a cold start (fresh data volume). Most modules
     # create their own dir, but snapshots (day_open/mids csv) and pricing (HL
-    # DuckDB) do not, and would otherwise crash the day-open and 23:45 data tasks.
+    # DuckDB) do not, and would otherwise crash the day-open and 00:10 data tasks.
     for _d in ("data/snapshots", "data/pricing", "data/cache"):
         Path(_d).mkdir(parents=True, exist_ok=True)
 
@@ -450,7 +455,7 @@ def main():
             next_due = dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc) + dt.timedelta(hours=POSITION_CHECK_INTERVAL_HOURS)
             logger.info(f"[position_check] not due, next at {next_due.isoformat()}")
 
-        # ── Data task (nightly at 23:45 UTC) ──────────────────────────────────
+        # ── Data task (nightly at 00:10 UTC) ──────────────────────────────────
         # 1. Download HL OHLCV (for coins not in Binance data); skipped on testnet.
         # 2. build() reads daily_closes.parquet (Binance) + HL DuckDB → daily_ohlcv.parquet.
         # Today's live prices are appended in-memory at intent time via get_final_pricing().
@@ -479,7 +484,7 @@ def main():
             last_ms = state.get("last_mkt_cap_run_ms", 0)
             logger.debug(f"[mkt_cap] not due (last run: {dt.datetime.fromtimestamp((last_ms or 0) / 1000, tz=dt.timezone.utc).isoformat()}, scheduled: {MKT_CAP_HOUR_UTC:02d}:{MKT_CAP_MINUTE_UTC:02d} UTC)")
 
-        # ── Exchange meta task (daily at 23:45 UTC) ───────────────────────────
+        # ── Exchange meta task (daily at 23:40 UTC) ───────────────────────────
         if is_meta_due(now, state):
             try:
                 from scripts.meta_data import fetch_meta, store_meta

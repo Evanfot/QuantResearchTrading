@@ -2,9 +2,12 @@
 Build and maintain the daily OHLCV cache.
 
 Binance data is provided by the external binance-klines project and written to
-  $BINANCE_KLINES_DIR/klines/processed/daily_closes.parquet  (available ~03:00 UTC).
+  $BINANCE_KLINES_DIR/klines/processed/daily_closes.parquet
+The stream writes the just-closed day's *provisional* close there at ~23:58 UTC;
+the official Binance archive overwrites it ~1-2 days later. We read the provisional
+so the trader can act on the day's close without waiting for the official file.
 
-Nightly at 23:45 UTC (trader data task):
+Nightly at 00:10 UTC (trader data task) — after the 23:58 provisional write:
   build() — downloads HL OHLCV, then reads daily_closes.parquet (Binance) +
     HL DuckDB → daily_ohlcv.parquet.
 
@@ -169,7 +172,7 @@ if __name__ == "__main__":
 
     def _seconds_until_next_run() -> float:
         now = _dt.datetime.now(_dt.timezone.utc)
-        target = now.replace(hour=23, minute=45, second=0, microsecond=0)
+        target = now.replace(hour=0, minute=10, second=0, microsecond=0)
         if now >= target:
             target += _dt.timedelta(days=1)
         return (target - now).total_seconds()
@@ -179,7 +182,7 @@ if __name__ == "__main__":
 
     while True:
         delay = _seconds_until_next_run()
-        print(f"[cache-builder] next build in {delay / 3600:.1f}h  (23:45 UTC)", flush=True)
+        print(f"[cache-builder] next build in {delay / 3600:.1f}h  (00:10 UTC)", flush=True)
         time.sleep(delay)
         _download_hl()
         build()
