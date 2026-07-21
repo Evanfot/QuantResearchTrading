@@ -31,12 +31,43 @@ from datetime import timezone
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-UNIVERSE_SIZE     = 50
-ADD_THRESHOLD     = 47
-REMOVE_THRESHOLD  = 53
+# Sized so the *tradable* book (top-N genuine cryptos ∩ Hyperliquid) is ~50: on the
+# current snapshot only ~50/80 of the top-80 genuine coins are HL-listed. ADD/REMOVE
+# keep a ±3-rank hysteresis buffer around N. (If the kPEPE/kSHIB memecoin mapping is
+# later added, more coins count as tradable and N should come back down.)
+UNIVERSE_SIZE     = 80
+ADD_THRESHOLD     = 77
+REMOVE_THRESHOLD  = 83
 
-STABLE = {"USDT", "USDC", "DAI", "USDD", "FDUSD", "TUSD", "DEI", "USDP", "GUSD", "USDE"}
-EXCLUDED = {"PAXG"}
+# Tokens removed from the market-cap ranking because they are not genuine,
+# independently-trending cryptocurrencies: fiat-pegged stablecoins, wrapped /
+# liquid-staking derivatives (track an already-ranked underlying), commodity
+# trackers, and tokenized funds / RWAs. Removing them BEFORE ranking keeps a real
+# coin's rank reflecting its true market-cap standing. Curated by hand — extend
+# these sets as new such tokens climb into the top ranks. (Exchange/utility tokens
+# like LEO/OKB/BGB are deliberately NOT excluded; they are genuine tokens and are
+# filtered later only if they aren't tradable on Hyperliquid.)
+
+# Fiat-pegged stablecoins.
+STABLE = {
+    "USDT", "USDC", "DAI", "USDD", "FDUSD", "TUSD", "DEI", "USDP", "GUSD", "USDE",
+    "USDS", "USD1", "USDG", "PYUSD", "USDY", "RLUSD", "USDF", "BFUSD", "USDGO", "U",
+    "USD0", "USDX", "CRVUSD", "GHO", "LUSD", "FRAX", "SUSD", "USDL", "USDB",
+}
+
+# Wrapped / liquid-staking derivatives (track an underlying already in the ranking).
+_WRAPPED = {
+    "WBTC", "WETH", "WBETH", "WEETH", "WSTETH", "STETH", "CBETH", "RETH", "METH",
+    "WBNB", "WSOL", "LBTC", "SOLVBTC", "BTCB", "EZETH", "RSETH", "SWETH",
+}
+# Commodity trackers (e.g. tokenized gold).
+_COMMODITY = {"PAXG", "XAUT"}
+# Tokenized funds / real-world-asset money-market instruments.
+_TOKENIZED_RWA = {
+    "BUIDL", "USYC", "EUTBL", "BCAP", "FIGR_HELOC", "OUSG", "USTB", "BENJI",
+    "JAAA", "JTRSY",
+}
+EXCLUDED = _WRAPPED | _COMMODITY | _TOKENIZED_RWA
 
 MKT_CAP_DIR = Path("data/mkt_cap")
 MKT_CAP_DIR.mkdir(parents=True, exist_ok=True)
