@@ -4,6 +4,15 @@ from src.universe import get_universe, ADD_THRESHOLD, REMOVE_THRESHOLD, UNIVERSE
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+#
+# Rank thresholds are read from src.universe (ADD_THRESHOLD / REMOVE_THRESHOLD /
+# UNIVERSE_SIZE) rather than hardcoded, so these tests exercise the real buffer
+# zone (ADD_THRESHOLD, REMOVE_THRESHOLD] and keep passing when the sizing changes
+# (e.g. the top-50 → top-80 move). POOL is a symbol pool comfortably larger than
+# any threshold so every rank under test is actually representable.
+
+POOL = REMOVE_THRESHOLD + 20
+
 
 def make_market_cap(symbols: list[str]) -> pd.DataFrame:
     """Build a minimal market-cap DataFrame ranked in the order given.
@@ -24,31 +33,31 @@ def hl_set(symbols: list[str]) -> set:
 
 
 def coins(n: int, prefix: str = "C") -> list[str]:
-    """Generate n distinct coin symbols: C01, C02, ..."""
-    return [f"{prefix}{i:02d}" for i in range(1, n + 1)]
+    """Generate n distinct coin symbols: C001, C002, ..."""
+    return [f"{prefix}{i:03d}" for i in range(1, n + 1)]
+
+
+def rerank(symbols: list[str], coin: str, rank: int) -> list[str]:
+    """Return `symbols` reordered so `coin` sits at 1-based market-cap `rank`."""
+    others = [s for s in symbols if s != coin]
+    return others[:rank - 1] + [coin] + others[rank - 1:]
 
 
 # ── Initial universe ──────────────────────────────────────────────────────────
 
-def test_initial_universe_is_top_50():
-    syms = coins(100)
-    top = make_market_cap(syms)
-    hl  = hl_set(syms)
-
-    universe, _ = get_universe(top, hl, current_universe=None)
+def test_initial_universe_is_top_n():
+    syms = coins(POOL)
+    universe, _ = get_universe(make_market_cap(syms), hl_set(syms), current_universe=None)
 
     assert len(universe) == UNIVERSE_SIZE
     assert set(universe) == set(syms[:UNIVERSE_SIZE])
 
 
-def test_initial_universe_fewer_than_50_eligible():
-    syms = coins(30)
-    top = make_market_cap(syms)
-    hl  = hl_set(syms)
+def test_initial_universe_fewer_than_n_eligible():
+    syms = coins(UNIVERSE_SIZE - 20)
+    universe, _ = get_universe(make_market_cap(syms), hl_set(syms), current_universe=None)
 
-    universe, _ = get_universe(top, hl, current_universe=None)
-
-    assert len(universe) == 30
+    assert len(universe) == len(syms)
     assert set(universe) == set(syms)
 
 
@@ -56,164 +65,126 @@ def test_initial_universe_fewer_than_50_eligible():
 
 def test_no_change_when_all_coins_within_buffer():
     """Universe is stable when no coin breaches either threshold."""
-    syms = coins(60)
-    current = syms[:UNIVERSE_SIZE]          # top 50 currently in universe
-    top = make_market_cap(syms)             # same ranking — nothing has moved
-    hl  = hl_set(syms)
+    syms = coins(POOL)
+    current = syms[:UNIVERSE_SIZE]           # top-N currently in universe
+    top = make_market_cap(syms)              # same ranking — nothing has moved
 
-    universe, _ = get_universe(top, hl, current_universe=current)
+    universe, _ = get_universe(top, hl_set(syms), current_universe=current)
 
     assert set(universe) == set(current)
 
 
+# ── Removal logic (existing coins vs REMOVE_THRESHOLD) ─────────────────────────
+
 def test_coin_at_exact_remove_threshold_is_retained():
-    """A coin ranked exactly REMOVE_THRESHOLD (53) must NOT be removed."""
-    syms = coins(70)
-    current = syms[:UNIVERSE_SIZE]          # C01–C50 in universe
-
-    # Move C01 (previously rank 1) to rank 53 exactly
-    reranked = syms[1:REMOVE_THRESHOLD] + [syms[0]] + syms[REMOVE_THRESHOLD:]
-    top = make_market_cap(reranked)
-    hl  = hl_set(syms)
-
-    universe, _ = get_universe(top, hl, current_universe=current)
-
-    assert syms[0] in universe, f"{syms[0]} at rank {REMOVE_THRESHOLD} should be retained"
-
-
-def test_coin_at_exact_add_threshold_is_not_added():
-    """A new coin ranked exactly ADD_THRESHOLD (47) must be added (boundary inclusive)."""
-    syms = coins(70)
-    current = syms[:UNIVERSE_SIZE]          # C01–C50 in universe
-    new_coin = "NEW"
-
-    # Insert NEW at rank ADD_THRESHOLD (position index ADD_THRESHOLD - 1)
-    reranked = syms[:ADD_THRESHOLD - 1] + [new_coin] + syms[ADD_THRESHOLD - 1:]
-    top = make_market_cap(reranked)
-    hl  = hl_set(syms + [new_coin])
-
-    universe, _ = get_universe(top, hl, current_universe=current)
-
-    assert new_coin in universe, f"new coin at rank {ADD_THRESHOLD} should be added"
-
-
-# ── Removal logic ─────────────────────────────────────────────────────────────
-
-def test_coin_removed_when_rank_exceeds_53():
-    """A coin that drops to rank 54 must be removed from the universe."""
-    syms = coins(70)
-    current = syms[:UNIVERSE_SIZE]          # C01–C50
-
-    # Drop C01 to rank 54 (index 53)
-    reranked = syms[1:54] + [syms[0]] + syms[54:]
-    top = make_market_cap(reranked)
-    hl  = hl_set(syms)
-
-    universe, _ = get_universe(top, hl, current_universe=current)
-
-    assert syms[0] not in universe, f"{syms[0]} at rank 54 should be removed"
-
-
-def test_coin_not_removed_at_rank_53():
-    """A coin at rank 53 sits inside the buffer and must be kept."""
-    syms = coins(70)
+    """A coin ranked exactly REMOVE_THRESHOLD must NOT be removed."""
+    syms = coins(POOL)
     current = syms[:UNIVERSE_SIZE]
+    coin = syms[0]                           # currently rank 1
 
-    # Move C01 to rank 53 (index 52)
-    reranked = syms[1:52] + [syms[0]] + syms[52:]
-    top = make_market_cap(reranked)
-    hl  = hl_set(syms)
+    top = make_market_cap(rerank(syms, coin, REMOVE_THRESHOLD))
+    universe, _ = get_universe(top, hl_set(syms), current_universe=current)
 
-    universe, _ = get_universe(top, hl, current_universe=current)
-
-    assert syms[0] in universe
+    assert coin in universe, f"{coin} at rank {REMOVE_THRESHOLD} should be retained"
 
 
-def test_coin_not_removed_at_rank_48():
-    """A coin at rank 48 is comfortably inside both thresholds — retained."""
-    syms = coins(70)
+def test_coin_removed_when_rank_exceeds_remove_threshold():
+    """A coin that drops just past REMOVE_THRESHOLD must be removed."""
+    syms = coins(POOL)
     current = syms[:UNIVERSE_SIZE]
+    coin = syms[0]
 
-    reranked = syms[1:47] + [syms[0]] + syms[47:]
-    top = make_market_cap(reranked)
-    hl  = hl_set(syms)
+    top = make_market_cap(rerank(syms, coin, REMOVE_THRESHOLD + 1))
+    universe, _ = get_universe(top, hl_set(syms), current_universe=current)
 
-    universe, _ = get_universe(top, hl, current_universe=current)
+    assert coin not in universe, f"{coin} at rank {REMOVE_THRESHOLD + 1} should be removed"
 
-    assert syms[0] in universe
+
+def test_coin_not_removed_inside_remove_threshold():
+    """A coin comfortably inside REMOVE_THRESHOLD is retained."""
+    syms = coins(POOL)
+    current = syms[:UNIVERSE_SIZE]
+    coin = syms[0]
+
+    top = make_market_cap(rerank(syms, coin, REMOVE_THRESHOLD - 5))
+    universe, _ = get_universe(top, hl_set(syms), current_universe=current)
+
+    assert coin in universe
 
 
 def test_coin_not_listed_on_hl_is_removed():
     """A coin delisted from Hyperliquid must leave the universe immediately."""
-    syms = coins(60)
+    syms = coins(POOL)
     current = syms[:UNIVERSE_SIZE]
     delisted = syms[0]
 
-    top = make_market_cap(syms)
-    hl  = hl_set(syms[1:])                 # delisted is absent from HL
-
-    universe, _ = get_universe(top, hl, current_universe=current)
+    # delisted keeps its top rank but is absent from HL
+    universe, _ = get_universe(make_market_cap(syms), hl_set(syms[1:]),
+                               current_universe=current)
 
     assert delisted not in universe
 
 
-# ── Addition logic ────────────────────────────────────────────────────────────
+# ── Addition logic (new coins vs ADD_THRESHOLD) ────────────────────────────────
 
-def test_new_coin_added_when_rank_below_47():
-    """A coin not in the universe that reaches rank 46 must be added."""
-    syms = coins(70)
+def test_new_coin_added_at_exact_add_threshold():
+    """A new coin ranked exactly ADD_THRESHOLD is added (boundary inclusive)."""
+    syms = coins(POOL)
     current = syms[:UNIVERSE_SIZE]
     new_coin = "NEW"
 
-    # Insert NEW at rank 46 (index 45)
-    reranked = syms[:45] + [new_coin] + syms[45:]
-    top = make_market_cap(reranked)
-    hl  = hl_set(syms + [new_coin])
+    top = make_market_cap(rerank(syms + [new_coin], new_coin, ADD_THRESHOLD))
+    universe, _ = get_universe(top, hl_set(syms + [new_coin]), current_universe=current)
 
-    universe, _ = get_universe(top, hl, current_universe=current)
+    assert new_coin in universe, f"new coin at rank {ADD_THRESHOLD} should be added"
+
+
+def test_new_coin_added_inside_add_threshold():
+    """A new coin comfortably inside ADD_THRESHOLD is added."""
+    syms = coins(POOL)
+    current = syms[:UNIVERSE_SIZE]
+    new_coin = "NEW"
+
+    top = make_market_cap(rerank(syms + [new_coin], new_coin, ADD_THRESHOLD - 5))
+    universe, _ = get_universe(top, hl_set(syms + [new_coin]), current_universe=current)
 
     assert new_coin in universe
 
 
-def test_new_coin_not_added_when_rank_is_48():
-    """A coin outside the universe at rank 48 sits in the buffer — must not be added."""
-    syms = coins(70)
+def test_new_coin_not_added_just_past_add_threshold():
+    """A new coin one rank past ADD_THRESHOLD sits in the buffer — must not be added."""
+    syms = coins(POOL)
     current = syms[:UNIVERSE_SIZE]
     new_coin = "NEW"
 
-    # Insert NEW at rank 48 (index 47)
-    reranked = syms[:47] + [new_coin] + syms[47:]
-    top = make_market_cap(reranked)
-    hl  = hl_set(syms + [new_coin])
+    top = make_market_cap(rerank(syms + [new_coin], new_coin, ADD_THRESHOLD + 1))
+    universe, _ = get_universe(top, hl_set(syms + [new_coin]), current_universe=current)
 
-    universe, _ = get_universe(top, hl, current_universe=current)
-
-    assert new_coin not in universe
+    assert new_coin not in universe, f"new coin at rank {ADD_THRESHOLD + 1} should not be added"
 
 
-def test_new_coin_not_added_when_rank_is_53():
-    """A coin at rank 53 is outside the add threshold and must not be added."""
-    syms = coins(70)
+def test_new_coin_not_added_at_remove_threshold():
+    """A new coin at REMOVE_THRESHOLD is inside the buffer, not the add zone — not added.
+
+    Only an *existing* member is retained down to REMOVE_THRESHOLD; a coin that is
+    not already in the universe must reach ADD_THRESHOLD to enter.
+    """
+    syms = coins(POOL)
     current = syms[:UNIVERSE_SIZE]
     new_coin = "NEW"
 
-    reranked = syms[:52] + [new_coin] + syms[52:]
-    top = make_market_cap(reranked)
-    hl  = hl_set(syms + [new_coin])
+    top = make_market_cap(rerank(syms + [new_coin], new_coin, REMOVE_THRESHOLD))
+    universe, _ = get_universe(top, hl_set(syms + [new_coin]), current_universe=current)
 
-    universe, _ = get_universe(top, hl, current_universe=current)
-
-    assert new_coin not in universe
+    assert new_coin not in universe, f"new coin at rank {REMOVE_THRESHOLD} should not be added"
 
 
 # ── Symbol index ──────────────────────────────────────────────────────────────
 
 def test_symbol_index_matches_universe():
-    syms = coins(60)
-    top = make_market_cap(syms)
-    hl  = hl_set(syms)
-
-    universe, symbol_index = get_universe(top, hl, current_universe=None)
+    syms = coins(POOL)
+    universe, symbol_index = get_universe(make_market_cap(syms), hl_set(syms),
+                                          current_universe=None)
 
     assert set(symbol_index.keys()) == set(universe)
     for sym, idx in symbol_index.items():
