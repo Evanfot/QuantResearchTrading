@@ -536,17 +536,30 @@ def main():
                 halted = False
                 if not DRY_RUN and orders:
                     print(generate_readable_summary(orders, ltps))
-                    response = ex.bulk_orders(orders)
-                    if response.get("status") == "ok":
+                    # Two-phase submission: send the margin-releasing reductions
+                    # (reduce_only) first so their fills settle and free margin
+                    # before the margin-consuming increases are checked. Submitting
+                    # the whole rebalance as one batch lets tail orders hit
+                    # INSUFFICIENT_MARGIN even when the net target position fits.
+                    reductions = [o for o in orders if o.get("reduce_only")]
+                    increases = [o for o in orders if not o.get("reduce_only")]
+                    accepted_total = 0
+                    for phase, batch in (("reduce", reductions), ("increase", increases)):
+                        if not batch:
+                            continue
+                        response = ex.bulk_orders(batch)
+                        if response.get("status") != "ok":
+                            logger.error(f"[exec] {phase} bulk submission failed (top-level): {response}")
+                            continue
                         all_statuses = response["response"]["data"]["statuses"]
                         # HL returns top-level "ok" even when individual orders are
                         # rejected ({"error": ...}); classify each status so rejections
                         # (and their reason) are surfaced instead of counted as submitted.
-                        result = classify_order_responses(orders, all_statuses)
+                        result = classify_order_responses(batch, all_statuses)
                         if result.count_mismatch:
                             logger.error(
-                                f"[exec] status count {len(all_statuses)} != order count "
-                                f"{len(orders)} — response may be misaligned: {response}"
+                                f"[exec] {phase} status count {len(all_statuses)} != order count "
+                                f"{len(batch)} — response may be misaligned: {response}"
                             )
                         for co in result.classified:
                             order_logger.log_order_submission(
@@ -564,16 +577,15 @@ def main():
                             logger.error(f"[exec] order REJECTED [{co.status.value}] — {co.coin}: {co.error}")
                         if result.rejected:
                             logger.warning(
-                                f"[exec] {len(result.rejected)}/{len(orders)} orders rejected by exchange "
+                                f"[exec] {phase}: {len(result.rejected)}/{len(batch)} orders rejected by exchange "
                                 f"(accepted {len(result.accepted)})"
                             )
                             # "Trading is halted." is a transient exchange-side condition;
                             # flag it so we retry soon instead of waiting the full interval.
-                            halted = result.halted
-                        if result.accepted:
-                            logging.info(f"[exec] Rebalance triggered — {len(result.accepted)}/{len(orders)} orders accepted")
-                    else:
-                        logger.error(f"[exec] bulk submission failed (top-level): {response}")
+                            halted = halted or result.halted
+                        accepted_total += len(result.accepted)
+                    if accepted_total:
+                        logging.info(f"[exec] Rebalance triggered — {accepted_total}/{len(orders)} orders accepted")
 
                 open_orders = run_fill_logger()
                 state = load_state(STATE_PATH)
