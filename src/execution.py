@@ -160,15 +160,18 @@ def get_execution_plan(
         dollar_target = abs(target_qty) * ltp
         dollar_delta = abs(delta) * ltp
 
-        if dollar_target < 10:
-            if current_qty != 0:
-                target_qty = 0
-                delta = -current_qty
-                dollar_delta = abs(delta) * ltp
-            else:
-                continue
+        # A position whose *target* notional is under the $10 floor can't be held
+        # as a live order, so fold it into a full close (target 0).
+        if dollar_target < 10 and current_qty != 0:
+            target_qty = 0
+            delta = -current_qty
+            dollar_delta = abs(delta) * ltp
 
-        if round(dollar_delta, 2) < 10 and target_qty != 0:
+        # HL rejects any order under $10. That covers both a tiny rebalance delta
+        # and a residual "dust" close (target 0 but the leftover position is worth
+        # <$10) — such a position is simply unclosable via a normal order, so skip
+        # it rather than resubmitting a guaranteed MIN_NOTIONAL rejection each tick.
+        if round(dollar_delta, 2) < 10:
             continue
 
         slippage_factor = (
@@ -186,13 +189,22 @@ def get_execution_plan(
         precision = max(0, MAX_PRECISION - sz_dec)
         clean_px = round(float(f"{adj_px:.5g}"), precision)
 
+        # reduce_only when the trade strictly shrinks |position| without flipping
+        # sign: it can never require new margin, so HL won't reserve any for it.
+        # This is what lets the two-phase submission free margin before increases.
+        reduce_only = (
+            current_qty != 0
+            and np.sign(delta) == -np.sign(current_qty)
+            and abs(delta) <= abs(current_qty)
+        )
+
         exchange_orders.append({
             "coin": coin,
             "is_buy": side.upper() == "BUY",
             "sz": clean_sz,
             "limit_px": clean_px,
             "order_type": {"limit": {"tif": "Gtc"}},
-            "reduce_only": False,
+            "reduce_only": bool(reduce_only),
         })
 
     return exchange_orders
