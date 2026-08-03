@@ -241,9 +241,9 @@ def test_untradable_top_coins_do_not_backfill_with_lower_ranks():
 
 def test_tradable_universe_may_be_smaller_than_n():
     """Plenty of eligible coins exist, but few of the top N are tradable."""
-    syms = coins(100)
+    syms = coins(POOL)
     top = make_market_cap(syms)
-    hl = hl_set(syms[:20] + syms[60:])              # only 20 of the top 50 listed
+    hl = hl_set(syms[:20] + syms[UNIVERSE_SIZE:])   # only 20 of the top N listed
 
     universe, _ = get_universe(top, hl, current_universe=None)
 
