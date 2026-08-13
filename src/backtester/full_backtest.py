@@ -21,7 +21,7 @@ class StrategyConfig:
     threshold_trade: bool = False
     add_commission: bool = False
     position_multiplier: float = 10.0
-    weight_multiplier: float = 0.025
+    weight_multiplier: float = 0.0225
     small_threshold: float = 10.0
 
 
