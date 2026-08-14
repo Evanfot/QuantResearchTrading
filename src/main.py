@@ -11,7 +11,7 @@ import pandas as pd
 
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
 from src.data import db_path, get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
-from src.execution import classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
+from src.execution import cap_gross_leverage, classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
 from src.loggers.order_logger import OrderLogger
@@ -196,6 +196,7 @@ def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_vi
         symbol: pos * conversion_factor
         for symbol, pos in zip(tradable_symbols, strategy_intent.target_position)
     }
+    target_weights = cap_gross_leverage(target_weights, config.max_gross_leverage, logger)
     target_zeroes = {coin: 0 for coin in set(positions.keys()) - set(target_weights.keys())}
     intent_log["universe"]["holdings_outside_universe"] = list(target_zeroes.keys())
 
