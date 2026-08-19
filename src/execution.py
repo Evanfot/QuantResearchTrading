@@ -115,6 +115,28 @@ def classify_order_responses(orders: list, statuses: list) -> ExecutionResult:
     return ExecutionResult(classified=classified, count_mismatch=len(orders) != len(statuses))
 
 
+def cap_gross_leverage(weights: dict, max_gross_leverage: float, logger: object = None) -> dict:
+    """Scale a target-weight book down uniformly if its gross leverage exceeds a cap.
+
+    Vol-target sizing (weight ~ signal / expected_vol) has no natural ceiling: as
+    realized vol compresses, the same signal conviction produces ever-larger
+    positions. This is a hard backstop on that, independent of the vol regime.
+    NaN weights (unpriced/unmasked assets) are ignored in the gross sum and left
+    untouched — they're already skipped downstream by get_order_intention.
+    """
+    values = np.array(list(weights.values()), dtype=float)
+    gross = float(np.nansum(np.abs(values)))
+    if gross <= max_gross_leverage or gross == 0:
+        return weights
+    scale = max_gross_leverage / gross
+    if logger is not None:
+        logger.warning(
+            f"[sizing] gross target leverage {gross:.2f}x exceeds cap "
+            f"{max_gross_leverage:.2f}x — scaling book down by {scale:.3f}x"
+        )
+    return {symbol: w * scale for symbol, w in weights.items()}
+
+
 def get_order_intention(
     target_qtys: dict, logger: object, positions_input: dict = None
 ) -> dict:

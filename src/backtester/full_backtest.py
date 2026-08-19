@@ -23,6 +23,7 @@ class StrategyConfig:
     position_multiplier: float = 10.0
     weight_multiplier: float = 0.0225
     small_threshold: float = 10.0
+    max_gross_leverage: float = 4.5  # hard cap on sum(|target_weight|); book scales down proportionally if breached
 
 
 @dataclass
