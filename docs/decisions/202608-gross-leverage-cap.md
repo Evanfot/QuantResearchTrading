@@ -1,16 +1,32 @@
-# Hard gross-leverage cap on live sizing: 3.7x
+# Hard gross-leverage cap on live sizing: 4.5x
 
 Date: 2026-08-14
 Status: Active
 
 ## Decision
-`run_live`'s target-weight book is capped at **`max_gross_leverage = 3.7x`**
+`run_live`'s target-weight book is capped at **`max_gross_leverage = 4.5x`**
 (`StrategyConfig.max_gross_leverage`, `src/backtester/full_backtest.py`), enforced by
 `cap_gross_leverage` (`src/execution.py`): if `sum(|target_weight|)` exceeds the cap,
 every weight is scaled down uniformly (relative sizing between assets preserved)
 until gross leverage equals the cap exactly.
 
-3.7x was back-solved from live margin mechanics, not chosen as a round number:
+The cap was originally back-solved at **3.7x** from live margin mechanics (derivation
+below), then raised to **4.5x** before merge. Recomputing the same ratios at 4.5x:
+- `initial_margin_used ≈ gross_leverage / 6.24` → **~72%** of equity (vs. the ~60%
+  ceiling the original 3.7x derivation targeted).
+- `maintenance_margin_used ≈ gross_leverage / 12.5` → **~36%** MM ratio (vs. ~28% at
+  3.7x; still meaningful cushion below the ~50% MM ratio observed at the 6.3x incident
+  level, but less than the original derivation banked).
+- Backtest average gross leverage (~2.43x, see below) is ~1.85x the 4.5x cap, vs. 1.52x
+  at 3.7x — the cap now binds somewhat more readily than the original design intended,
+  though it should still act as a tail backstop rather than a routine constraint in a
+  normal vol regime.
+
+The original back-solve is preserved below since the underlying margin-mechanics
+derivation (the /6.24 and /12.5 ratios) is unchanged — only the target IM/MM headroom
+being solved for was revised upward.
+
+**3.7x** (original back-solve) was derived from live margin mechanics, not chosen as a round number:
 - **IM headroom.** The account's blended per-asset leverage-tier mix implies
   `initial_margin_used ≈ gross_leverage / 6.24`. To keep IM usage under ~60% of
   equity (so new/increasing orders always have room, instead of hitting
@@ -98,14 +114,21 @@ recur once it does again in some future low-vol stretch).
   alone; superseded as the primary control by this cap.
 
 ## Consequences
-- On a day the uncapped book would exceed 3.7x gross (as it has consistently since
-  mid-July 2026), the whole target book is scaled down uniformly — realized vol on
-  those days will run below the strategy's nominal target until the vol regime
-  normalizes or `weight_multiplier` is retuned.
+- On a day the uncapped book would exceed 4.5x gross, the whole target book is scaled
+  down uniformly — realized vol on those days will run below the strategy's nominal
+  target until the vol regime normalizes or `weight_multiplier` is retuned. Because
+  4.5x sits closer to the incident-era uncapped range (5.2–6.8x since mid-July) than
+  3.7x did, this cap binds on a smaller share of over-cap days, i.e. leaves more of
+  the pre-incident leverage-creep behavior un-throttled on the margin.
+- Raising the cap from the back-solved 3.7x to 4.5x consumes more of the margin
+  cushion the original derivation was designed to preserve (~72% vs. ~60% IM/equity,
+  ~36% vs. ~28% MM/equity) — re-review this against live `withdrawable` and
+  `totalMarginUsed` behavior post-deploy; tighten back toward 3.7x if IM headroom
+  proves too thin in practice.
 - `run_backtest` (and therefore any analysis built on it, including the MVO
   comparison above) does **not** enforce this cap — future backtests will keep
   overstating deployable leverage relative to what live will actually run whenever
-  the uncapped book would exceed 3.7x. Worth a follow-up to bring `run_backtest`
+  the uncapped book would exceed 4.5x. Worth a follow-up to bring `run_backtest`
   in line, once its separate compounding/weight-scale inconsistency vs.
   `run_backtest_mvo` is reconciled.
 - The cap is portfolio-level; it does not by itself prevent specific low-leverage-tier
