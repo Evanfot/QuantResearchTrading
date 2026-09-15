@@ -116,11 +116,21 @@ services:
   # Watch dev's RP + MVO sizing in parallel with the live mainnet `trader`
   # WITHOUT touching it. Fully isolated: its own logs/state/data dirs, DRY_RUN
   # (never submits or cancels orders), SHADOW_SIZING (logs both models). It reads
-  # the real mainnet account read-only for positions/equity and computes from the
-  # binance-klines cache it builds in its own ./data-dev.
+  # the real mainnet account read-only for positions/equity.
   #
-  # Start before ~23:40 UTC so its nightly meta(23:40)+data(23:45) tasks bootstrap
-  # ./data-dev; shadow sizes land at 00:01 UTC in:
+  # Data: Hyperliquid OHLCV downloaded straight into its own ./data-dev/pricing
+  # DuckDB (main's pipeline, src/main.py's nightly data task) -- NOT the
+  # binance-klines cache the other services below still use. That producer's
+  # Futures WS has been geo-blocked since 2026-08-02 (unfixed); this shadow
+  # validation needed a working data source now, so it reads Hyperliquid
+  # directly instead of waiting on that fix. See
+  # docs/decisions/202609-mvo-transition-investigation.md for the full
+  # backtest-vs-holdout validation behind the MVO params being shadow-tested
+  # here (config/strategy_registry.toml's trend_mvo_v1 entry).
+  #
+  # Start before ~00:10 UTC so its nightly data(00:10)+intent(00:12) tasks
+  # bootstrap ./data-dev/pricing/ohlcv_data.duckdb from a cold start; shadow
+  # sizes land at 00:12 UTC in:
   #   logs-dev/intent_mainnet.jsonl         (primary: risk_parity)
   #   logs-dev/intent_mainnet_shadow.jsonl  (shadow:  mvo)
   #
@@ -140,7 +150,6 @@ services:
     env_file:
       - .env
     environment:
-      BINANCE_KLINES_DIR: /app/binance-klines
       DRY_RUN: "true"          # never submits/cancels orders — observer only
       SHADOW_SIZING: "true"    # log both risk_parity (primary) and mvo (shadow)
     volumes:
@@ -148,7 +157,6 @@ services:
       - ./logs-dev:/app/logs
       - ./state-dev:/app/state
       - ./data-dev:/app/data
-      - ~/projects/binance-klines:/app/binance-klines:ro
     networks:
       - binance-net
     command: python -m src.main

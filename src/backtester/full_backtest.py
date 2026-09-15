@@ -21,21 +21,38 @@ class StrategyConfig:
     threshold_trade: bool = False
     add_commission: bool = False
     position_multiplier: float = 10.0
-    weight_multiplier: float = 0.025
+    weight_multiplier: float = 0.0225
     small_threshold: float = 10.0
+    max_gross_leverage: float = 4.5  # hard cap on sum(|target_weight|); book scales down proportionally if breached
 
     # ── Sizing model selection ──────────────────────────────────────────────
     # Live default stays "risk_parity" while MVO is validated via SHADOW_SIZING;
     # flip to "mvo" to promote it (the other model then runs as the shadow).
     sizing_model: str = "risk_parity"     # "mvo" | "risk_parity"
     # MVO (max-Sharpe + vol-target) params — see full_backtest_mvo.MVOConfig
-    mvo_target_vol_daily: float = 0.022   # daily vol target (~2.5%/day realised)
+    #
+    # Values below are the "candidate" config from the holdout-validation
+    # investigation (docs/decisions/202609-mvo-transition-investigation.md), not
+    # the original feature/mvo defaults:
+    #   - mvo_gamma 0.1->1.0 and mvo_lookback 252->90: the original config beat
+    #     risk-parity in-sample but LOST money on a genuine holdout (Aug-Sep
+    #     2026); tighter L2 regularisation + a shorter covariance window fixed
+    #     that specific failure and generalised across a 12-block walk-forward.
+    #   - mvo_target_vol_daily 0.022->0.0172: 0.022 (43% annualised) was only
+    #     ever used so the investigation's comparison scripts could externally
+    #     relever both allocators to the SAME risk for a fair A/B. Production
+    #     has no such external relevering step, so this must match prod's
+    #     actual live-equivalent risk (32.8% annualised, i.e. weight_multiplier
+    #     0.0225's realised vol) directly, or MVO would run live at ~1.3x the
+    #     risk actually validated.
+    mvo_target_vol_daily: float = 0.0172  # 32.8% annualised -- matches prod's actual risk level
     mvo_trading_days: int = 365           # annualisation basis (crypto 24/7/365)
     mvo_max_position_weight: float = 0.30 # cap |weight| per asset (frac of equity)
-    mvo_gamma: float = 0.1
+    mvo_max_gross_leverage: float = 4.5   # matches risk-parity's execution-level cap above
+    mvo_gamma: float = 1.0
     mvo_rf: float = 0.15
     mvo_kelly_fraction: float = 0.25
-    mvo_lookback: int = 252
+    mvo_lookback: int = 90
     mvo_min_periods: int = 60
 
 

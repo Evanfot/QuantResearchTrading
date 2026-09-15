@@ -7,14 +7,15 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
+import duckdb
 import numpy as np
 import pandas as pd
 
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
 from src.backtester.full_backtest_mvo import MVOConfig, MVOIntent, compute_strategy_mvo
 from src.strategy import registry as strategy_registry
-from src.data import get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, latest_is_provisional, load_ohlcv_for_alphas
-from src.execution import classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
+from src.data import db_path, get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
+from src.execution import cap_gross_leverage, classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
 from src.helpers.dict_diff import dict_diff
 from src.loggers.intent_logger import IntentLogger, generate_run_id, init_asset, init_intent
 from src.loggers.order_logger import OrderLogger
@@ -205,6 +206,7 @@ def mvo_config_from_strategy(config: StrategyConfig) -> MVOConfig:
         target_vol_daily=config.mvo_target_vol_daily,
         trading_days=config.mvo_trading_days,
         max_position_weight=config.mvo_max_position_weight,
+        max_gross_leverage=config.mvo_max_gross_leverage,
         lookback=config.mvo_lookback,
         min_periods=config.mvo_min_periods,
     )
@@ -269,6 +271,12 @@ def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_vi
             symbol: pos * conversion_factor
             for symbol, pos in zip(tradable_symbols, strategy_intent.target_position)
         }
+
+    # Portfolio-level hard backstop, independent of which allocator produced the
+    # book: MVO's own MVOConfig.max_gross_leverage already caps at the allocator
+    # level, but this execution-level cap is the same safety net risk-parity gets,
+    # applied uniformly regardless of sizing_model (docs/decisions/202608-gross-leverage-cap.md).
+    target_weights = cap_gross_leverage(target_weights, config.max_gross_leverage, logger)
 
     target_zeroes = {coin: 0 for coin in set(positions.keys()) - set(target_weights.keys())}
     intent_log["universe"]["holdings_outside_universe"] = list(target_zeroes.keys())
@@ -456,16 +464,17 @@ def main():
             logger.info(f"[position_check] not due, next at {next_due.isoformat()}")
 
         # ── Data task (nightly at 00:10 UTC) ──────────────────────────────────
-        # 1. Download HL OHLCV (for coins not in Binance data); skipped on testnet.
-        # 2. build() reads daily_closes.parquet (Binance) + HL DuckDB → daily_ohlcv.parquet.
+        # Hyperliquid OHLCV, downloaded straight into ohlcv_data.duckdb (matches
+        # main's pipeline) -- shelved the binance-klines daily_ohlcv.parquet cache
+        # here (see docs/decisions/202609-mvo-transition-investigation.md): that
+        # producer's Futures WS has been geo-blocked since 2026-08-02, so main's
+        # still-working Hyperliquid path is what this MVO shadow validation reads.
         # Today's live prices are appended in-memory at intent time via get_final_pricing().
         if is_data_due(now, state):
-            logger.info("[data] rebuilding OHLCV cache from Binance + HL data")
+            logger.info("[data] downloading Hyperliquid OHLCV")
             if TRADING_ENV != "testnet":
                 run_ohlcv_dl()
                 update_daily()
-            from scripts.build_daily_cache import build as _build_daily_cache
-            _build_daily_cache()
             state["last_data_run_ms"] = int(now.timestamp() * 1000)
             save_state(state, STATE_PATH)
             logger.info("[data] complete")
@@ -526,15 +535,13 @@ def main():
                 )
 
                 # ── Data availability + freshness guard ──────────────────────────
-                # The cache may be missing (cold start before the nightly build) or
-                # stale (dead producer / unfinished rebuild). In every case skip and
-                # retry on the next tick rather than crash the process or size on a
-                # stale/gapped series. The provisional close (binance-klines live
-                # buffer, ~23:40 UTC) + the later official bar both land before this
-                # decision, so a current cache should hold the expected most-recent day.
+                # The DB may be missing (cold start) or stale (dead nightly data
+                # task). In either case skip and retry on the next tick rather than
+                # crash the process or size on a stale/gapped series.
                 _intent_skip_reason = None
                 try:
-                    prices_all = get_ohlcv()
+                    conn = duckdb.connect(db_path)
+                    prices_all = get_ohlcv(conn)
                     latest_cache_date = prices_all.index.max().date()
                     expected_date = (now - dt.timedelta(days=1)).date()
                     if latest_cache_date < expected_date:
@@ -542,8 +549,8 @@ def main():
                             f"data stale: latest cached close {latest_cache_date} < "
                             f"expected {expected_date}"
                         )
-                except (FileNotFoundError, RuntimeError) as e:
-                    _intent_skip_reason = f"cache not ready ({e})"
+                except (FileNotFoundError, duckdb.Error) as e:
+                    _intent_skip_reason = f"db not ready ({e})"
                 if _intent_skip_reason is not None:
                     _stale_key = now.strftime("%Y%m%dT%H%M")
                     if state.get("intent_stale_logged_min") != _stale_key:
@@ -556,13 +563,13 @@ def main():
                         first_run = False
                     sleep_until_next_tick(state)
                     continue
-                _is_prov = latest_is_provisional()
-                intent["meta"]["provisional_close"] = _is_prov
-                if _is_prov:
-                    logger.info(
-                        f"[intent] using PROVISIONAL close for {latest_cache_date} "
-                        f"(official Binance bar not yet published)"
-                    )
+                # No "provisional close" concept on the Hyperliquid path (that was
+                # specific to the binance-klines live-buffer close) -- the analogous
+                # protection is drop_incomplete_bars() inside get_final_pricing(),
+                # which already excludes the still-forming trailing bar. Key kept
+                # (as None) so existing log readers/schemas don't need to branch on
+                # its absence.
+                intent["meta"]["provisional_close"] = None
 
                 _missing = [c for c in universe if c not in prices_all.columns]
                 if _missing:
@@ -707,6 +714,9 @@ def main():
                 if not DRY_RUN and orders:
                     print(generate_readable_summary(orders, ltps))
                     # Strip to the fields the exchange expects; keep the full dict for logging.
+                    # REQUIRED: get_execution_plan enriches each order with target_qty/
+                    # current_qty/delta for logging/attribution, and the exchange SDK
+                    # rejects bulk_orders payloads containing those extra keys.
                     wire_keys = ("coin", "is_buy", "sz", "limit_px", "order_type", "reduce_only")
 
                     # Two-phase submission: send the margin-releasing reductions
