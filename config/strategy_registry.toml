@@ -30,7 +30,7 @@ risk_model  = "ledoit_wolf_v1"
 allocator   = "mvo_maxsharpe_voltarget_v1"
 created     = "2026-06-24"
 status      = "live"
-description = "Max-Sharpe tangency portfolio sized to a 2.2%/day vol target (365-annualised) with a 30% per-position cap."
+description = "Max-Sharpe tangency portfolio (Ledoit-Wolf cov, gamma=1.0 L2 reg, 90d lookback) sized to a 1.72%/day vol target (365-annualised, matches risk-parity's live risk level) with a 30% per-position cap and a 4.5x gross-leverage backstop. Params re-tuned from the original feature/mvo defaults (gamma 0.1, lookback 252, 2.2%/day) after a holdout validation found the originals beat risk-parity in-sample but lost money out-of-sample; see docs/decisions/202609-mvo-transition-investigation.md."
 
 # ── Component descriptions (documentation; not required by the loader) ────────
 

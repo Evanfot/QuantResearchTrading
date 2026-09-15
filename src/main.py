@@ -206,6 +206,7 @@ def mvo_config_from_strategy(config: StrategyConfig) -> MVOConfig:
         target_vol_daily=config.mvo_target_vol_daily,
         trading_days=config.mvo_trading_days,
         max_position_weight=config.mvo_max_position_weight,
+        max_gross_leverage=config.mvo_max_gross_leverage,
         lookback=config.mvo_lookback,
         min_periods=config.mvo_min_periods,
     )

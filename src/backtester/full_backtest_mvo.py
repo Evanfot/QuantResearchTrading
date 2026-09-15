@@ -49,7 +49,7 @@ class MVOConfig:
     target_vol_daily: float = 0.022  # daily vol target (sizing="vol_target")
     trading_days: int = 365     # annualisation basis — crypto trades 24/7/365
     max_position_weight: Optional[float] = None  # cap on |weight| per asset (frac of equity)
-    max_gross_leverage: float = 10.0  # cap on sum(|w|) to avoid per-period blow-ups
+    max_gross_leverage: float = 4.5  # cap on sum(|w|); matches StrategyConfig's live cap (dcb00c2/f50dfc5)
     lookback: int = 252         # trailing window (rows) for covariance estimation
     min_periods: int = 60       # min non-NaN rows an asset needs to be included
     weight_bounds: tuple = (None, None)  # (None, None) => long/short allowed
