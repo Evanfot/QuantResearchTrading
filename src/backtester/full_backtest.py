@@ -21,8 +21,9 @@ class StrategyConfig:
     threshold_trade: bool = False
     add_commission: bool = False
     position_multiplier: float = 10.0
-    weight_multiplier: float = 0.025
+    weight_multiplier: float = 0.0225
     small_threshold: float = 10.0
+    max_gross_leverage: float = 4.5  # hard cap on sum(|target_weight|); book scales down proportionally if breached
 
     # ── Sizing model selection ──────────────────────────────────────────────
     # Live default stays "risk_parity" while MVO is validated via SHADOW_SIZING;
