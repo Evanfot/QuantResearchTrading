@@ -83,7 +83,15 @@ def get_final_pricing(hyperliquid_prices, universe, latest_view):
 
 
 def load_ohlcv_for_alphas(universe):
-    """Load daily OHLCV for the universe from DuckDB, pivoted to wide format."""
+    """Load daily OHLCV for the universe from DuckDB, pivoted to wide format.
+
+    An empty universe (e.g. a cold/stale DB with no symbols yet matching the
+    tradable set) returns empty frames rather than issuing `WHERE symbol IN ()`,
+    which DuckDB rejects as a syntax error.
+    """
+    if not universe:
+        empty = pd.DataFrame(index=pd.DatetimeIndex([], name="date"))
+        return empty, empty.copy(), empty.copy(), empty.copy(), empty.copy()
     symbols_sql = ", ".join(f"'{s}/USDC:USDC'" for s in universe)
     conn = duckdb.connect(db_path)
     df = conn.execute(f"""
