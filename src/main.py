@@ -413,6 +413,16 @@ def main():
             ltps = update_ltps()
             latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
             prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
+
+            # If every coin dropped out of the universe (e.g. a data outage), prices/
+            # returns_adj are zero-column frames. Downstream signal functions assume
+            # at least one column -- ewm(...).corr() alone hits three different empty-
+            # input edge cases in pandas depending on how far the pipeline gets, so
+            # this is one guard for the whole class rather than patching each one.
+            if prices.shape[1] == 0:
+                logger.warning("[intent] universe is empty — skipping, will retry next tick")
+                continue
+
             tradable = list(prices.columns)
             symbol_index = {s: i for i, s in enumerate(tradable)}
 
