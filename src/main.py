@@ -580,6 +580,26 @@ def main():
                 latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
                 prices, returns_adj = get_final_pricing(prices_all, universe, latest_view)
 
+                # If EVERY coin got dropped above (e.g. a cold/not-yet-backfilled DB
+                # whose symbols don't match the universe at all yet), prices/returns_adj
+                # are zero-column frames. Every downstream signal function assumes at
+                # least one column -- ewm(...).corr() alone hits three different empty-
+                # input edge cases in pandas depending on how far the pipeline gets, so
+                # this is one guard for the whole class rather than patching each one.
+                if prices.shape[1] == 0:
+                    _empty_key = now.strftime("%Y%m%dT%H%M")
+                    if state.get("intent_empty_logged_min") != _empty_key:
+                        logger.warning(
+                            "[intent] universe is empty after dropping missing coins "
+                            "— skipping, will retry next tick"
+                        )
+                        state["intent_empty_logged_min"] = _empty_key
+                        save_state(state, STATE_PATH)
+                    if first_run:
+                        first_run = False
+                    sleep_until_next_tick(state)
+                    continue
+
                 intent["universe"]["tradable"] = universe
                 intent = initialise_asset_intent(intent, universe)
                 # Source sizing equity from the unified-margin USDC balance (not
