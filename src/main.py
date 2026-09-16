@@ -571,14 +571,42 @@ def main():
                 # its absence.
                 intent["meta"]["provisional_close"] = None
 
-                _missing = [c for c in universe if c not in prices_all.columns]
-                if _missing:
-                    logger.warning(f"[intent] {len(_missing)} coins absent from price cache, dropping from universe: {_missing}")
-                    universe = [c for c in universe if c in prices_all.columns]
-                    symbol_index = {sym: i for i, sym in enumerate(universe)}
                 ltps = update_ltps()
                 latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
                 prices, returns_adj = get_final_pricing(prices_all, universe, latest_view)
+
+                # Compare against prices.columns (post get_final_pricing), NOT
+                # prices_all.columns (raw DB columns): get_final_pricing suffixes
+                # universe to "SYMBOL/USDC:USDC" internally before matching and
+                # strips it back off on the way out, so prices.columns are bare
+                # names -- comparing bare universe names straight against the raw
+                # suffixed prices_all.columns made EVERY coin look "missing" on
+                # every cycle, regardless of whether the data was actually there.
+                _missing = [c for c in universe if c not in prices.columns]
+                if _missing:
+                    logger.warning(f"[intent] {len(_missing)} coins absent from price cache, dropping from universe: {_missing}")
+                    universe = [c for c in universe if c in prices.columns]
+                    symbol_index = {sym: i for i, sym in enumerate(universe)}
+
+                # If EVERY coin got dropped above (e.g. a cold/not-yet-backfilled DB
+                # whose symbols don't match the universe at all yet), prices/returns_adj
+                # are zero-column frames. Every downstream signal function assumes at
+                # least one column -- ewm(...).corr() alone hits three different empty-
+                # input edge cases in pandas depending on how far the pipeline gets, so
+                # this is one guard for the whole class rather than patching each one.
+                if prices.shape[1] == 0:
+                    _empty_key = now.strftime("%Y%m%dT%H%M")
+                    if state.get("intent_empty_logged_min") != _empty_key:
+                        logger.warning(
+                            "[intent] universe is empty after dropping missing coins "
+                            "— skipping, will retry next tick"
+                        )
+                        state["intent_empty_logged_min"] = _empty_key
+                        save_state(state, STATE_PATH)
+                    if first_run:
+                        first_run = False
+                    sleep_until_next_tick(state)
+                    continue
 
                 intent["universe"]["tradable"] = universe
                 intent = initialise_asset_intent(intent, universe)
