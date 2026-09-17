@@ -1,7 +1,9 @@
+import copy
 import datetime as dt
 import logging
 import os
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
@@ -10,6 +12,8 @@ import numpy as np
 import pandas as pd
 
 from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
+from src.backtester.full_backtest_mvo import MVOConfig, MVOIntent, compute_strategy_mvo
+from src.strategy import registry as strategy_registry
 from src.data import db_path, get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
 from src.execution import cap_gross_leverage, classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
 from src.helpers.dict_diff import dict_diff
@@ -44,6 +48,16 @@ TRADING_INTENT_MINUTE_UTC = 1
 POSITION_CHECK_INTERVAL_HOURS = 1
 
 DRY_RUN = False
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Also compute + log the *other* sizing model to a side file for parallel
+# validation, without ever feeding it to the executor. No effect while
+# sizing_model stays "risk_parity" and this flag stays unset/false.
+SHADOW_SIZING = _env_flag("SHADOW_SIZING", False)
 
 logger = logging.getLogger(__name__)
 
@@ -181,22 +195,88 @@ def log_strategy_intent(
         intent_log["assets"][symbol]["model"]["target_weight"] = float(weights[i])
 
 
+def mvo_config_from_strategy(config: StrategyConfig) -> MVOConfig:
+    """Build the MVO core config from the production StrategyConfig."""
+    return MVOConfig(
+        sizing="vol_target",
+        gamma=config.mvo_gamma,
+        rf=config.mvo_rf,
+        kelly_fraction=config.mvo_kelly_fraction,
+        target_vol_daily=config.mvo_target_vol_daily,
+        trading_days=config.mvo_trading_days,
+        max_position_weight=config.mvo_max_position_weight,
+        max_gross_leverage=config.mvo_max_gross_leverage,
+        lookback=config.mvo_lookback,
+        min_periods=config.mvo_min_periods,
+    )
+
+
+def log_strategy_intent_mvo(
+    intent_log: Dict[str, Any],
+    prices: pd.DataFrame,
+    mvo_intent: MVOIntent,
+    mvo_config: MVOConfig,
+):
+    mask = mvo_intent.mask
+    tradable = list(prices.columns.values[mask])
+    intent_log["universe"]["tradable"] = tradable
+    intent_log["universe"]["non_tradable"] = list(prices.columns.values[~mask])
+
+    for i, symbol in enumerate(tradable):
+        model = intent_log["assets"][symbol]["model"]
+        model["target_weight"] = float(mvo_intent.target_weight[i])
+        model["tangency_weight"] = float(mvo_intent.tangency_weight[i])
+        model["capped"] = bool(mvo_intent.capped[i])
+        model["risk_position"] = None  # risk-parity only
+
+    intent_log["sizing"].update({
+        "model": "mvo_max_sharpe",
+        "sizing_rule": "vol_target",
+        "target_vol_daily": mvo_config.target_vol_daily,
+        "target_vol_annual": mvo_config.target_vol_annual,
+        "trading_days": mvo_config.trading_days,
+        "max_position_weight": mvo_config.max_position_weight,
+        "gamma": mvo_config.gamma,
+        "applied_leverage": float(mvo_intent.leverage),
+        "expected_vol_annual": float(mvo_intent.expected_vol),
+        "gross_leverage": float(mvo_intent.gross),
+        "portfolio_mu": float(mvo_intent.portfolio_mu),
+    })
+
+
 def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_view, logger, intent_logger):
     t = prices.index[-1]
     mask = ~prices.loc[t].isna().values
-
-    strategy_intent = compute_strategy(
-        mu=mu[-1], vo=vo[-1], cor_matrix=cor.loc[t].values, mask=mask, config=config
-    )
-    log_strategy_intent(intent_log, prices, strategy_intent, config)
-
     tradable_symbols = prices.columns[mask]
-    conversion_factor = config.weight_multiplier / config.position_multiplier
-    target_weights = {
-        symbol: pos * conversion_factor
-        for symbol, pos in zip(tradable_symbols, strategy_intent.target_position)
-    }
+
+    if config.sizing_model == "mvo":
+        mvo_config = mvo_config_from_strategy(config)
+        mvo_intent = compute_strategy_mvo(
+            price_window=prices.loc[:t], mu_row=mu[-1], mask=mask, config=mvo_config
+        )
+        log_strategy_intent_mvo(intent_log, prices, mvo_intent, mvo_config)
+        target_weights = {
+            symbol: float(w)
+            for symbol, w in zip(tradable_symbols, mvo_intent.target_weight)
+        }
+    else:
+        strategy_intent = compute_strategy(
+            mu=mu[-1], vo=vo[-1], cor_matrix=cor.loc[t].values, mask=mask, config=config
+        )
+        log_strategy_intent(intent_log, prices, strategy_intent, config)
+        intent_log["sizing"]["model"] = "risk_parity"
+        conversion_factor = config.weight_multiplier / config.position_multiplier
+        target_weights = {
+            symbol: pos * conversion_factor
+            for symbol, pos in zip(tradable_symbols, strategy_intent.target_position)
+        }
+
+    # Portfolio-level hard backstop, independent of which allocator produced the
+    # book: MVO's own MVOConfig.max_gross_leverage already caps at the allocator
+    # level, but this execution-level cap is the same safety net risk-parity gets,
+    # applied uniformly regardless of sizing_model (docs/decisions/202608-gross-leverage-cap.md).
     target_weights = cap_gross_leverage(target_weights, config.max_gross_leverage, logger)
+
     target_zeroes = {coin: 0 for coin in set(positions.keys()) - set(target_weights.keys())}
     intent_log["universe"]["holdings_outside_universe"] = list(target_zeroes.keys())
 
@@ -231,6 +311,33 @@ def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_vi
     return order_intentions
 
 
+def run_shadow_sizing(prices, mu, vo, cor, positions, ltps, base_intent, live_config,
+                      latest_view, logger, shadow_logger):
+    """Compute + log the *other* sizing model on the same inputs, to a side file.
+
+    Reuses run_live so the shadow record is a full intent (weights + would-be
+    order intentions vs the real book), but its return value is discarded and the
+    executor never reads ``shadow_logger``'s file — so no real-money path touches it.
+    """
+    shadow_model = "mvo" if live_config.sizing_model != "mvo" else "risk_parity"
+    shadow_config = replace(live_config, sizing_model=shadow_model)
+
+    # Deep-copy the pre-sizing base (same market/signal/risk/portfolio inputs);
+    # re-stamp meta provenance for the shadow strategy (keep run_id/git to join).
+    shadow_intent = copy.deepcopy(base_intent)
+    prov = strategy_registry.provenance(shadow_config)
+    shadow_intent["meta"]["strategy"] = prov["strategy"]
+    shadow_intent["meta"]["strategy_components"] = prov["strategy_components"]
+    shadow_intent["meta"]["config_hash"] = prov["config_hash"]
+
+    try:
+        run_live(prices, mu, vo, cor, positions, ltps, shadow_intent, shadow_config,
+                 latest_view, logger, shadow_logger)
+        logger.info(f"[shadow] logged {prov['strategy']} intent to side file")
+    except Exception:
+        logger.warning("[shadow] sizing failed — live path unaffected", exc_info=True)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
@@ -260,6 +367,7 @@ def main():
     STATE_PATH = Path(f"state/hyperliquid_{TRADING_ENV}_{WALLET_ADDRESS}_state.json")
 
     intent_logger = IntentLogger(f"logs/intent_{TRADING_ENV}.jsonl")
+    shadow_intent_logger = IntentLogger(f"logs/intent_{TRADING_ENV}_shadow.jsonl")
     order_logger = OrderLogger(f"logs/orders_{TRADING_ENV}.jsonl")
 
     state = load_state(STATE_PATH)
@@ -393,8 +501,11 @@ def main():
         # ── Trading intent task (daily) ────────────────────────────────────────
         if is_trading_intent_due(now, state):
             logger.info("[intent] computing trading intent")
-            intent = init_intent(mode="live", strategy_name="trend_v1.1", run_id=run_id)
             config = StrategyConfig()
+            prov = strategy_registry.provenance(config)
+            intent = init_intent(mode="live", strategy_name=prov["strategy"], run_id=run_id, provenance=prov)
+            logger.info(f"[intent] strategy={prov['strategy']} commit={prov['git_commit']} "
+                        f"dirty={prov['git_dirty']} config_hash={prov['config_hash']}")
             state = load_state(STATE_PATH)
             positions = get_state_positions(state)
             try:
@@ -469,7 +580,15 @@ def main():
                 }
             intent["risk_inputs"]["correlation_matrix"] = cor.loc[prices.index[-1]].to_dict()
 
+            # Snapshot the pre-sizing intent so the shadow runs off identical inputs.
+            shadow_base = copy.deepcopy(intent) if SHADOW_SIZING else None
+
             run_live(prices, mu, vo, cor, positions, ltps, intent, config, latest_view, logger, intent_logger)
+
+            if SHADOW_SIZING:
+                run_shadow_sizing(prices, mu, vo, cor, positions, ltps, shadow_base, config,
+                                  latest_view, logger, shadow_intent_logger)
+
             state["last_trading_intent_run_id"] = run_id
             state["universe"] = universe
             save_state(state, STATE_PATH)
