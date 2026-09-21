@@ -3,10 +3,20 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: trader
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # Compute + log the *other* sizing model to a side file for parallel
+      # validation, without ever feeding it to the executor -- dormant until
+      # explicitly opted into for shadow-validating MVO. (DRY_RUN is NOT wired
+      # here: src/main.py's DRY_RUN is still a hardcoded constant, not read
+      # from the environment -- exposing it here unwired would be a footgun,
+      # since setting it wouldn't actually do anything.)
+      SHADOW_SIZING: ${SHADOW_SIZING:-false}
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
