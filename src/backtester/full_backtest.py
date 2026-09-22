@@ -42,15 +42,11 @@ class StrategyConfig:
     # generalised across a 12-block walk-forward and an independent
     # as-of-2025-12-31 time-robustness check.
     #
-    # mvo_target_vol_daily is HALVED from the validated 0.0172 (32.8% annualised)
-    # for an initial burn-in ramp: every backtest showed MVO running higher
-    # turnover than risk-parity (~1.4-1.7x vs ~1.2x) against a flat 4.5bps cost
-    # assumption that has never been checked against real fills. Running at
-    # half size for the first ~1-2 weeks limits downside while real execution
-    # cost is observed, before scaling to the fully-validated level. Bump to
-    # 0.0172 once real turnover/slippage looks reasonable -- this is the ONE
-    # line that needs to change to do that.
-    mvo_target_vol_daily: float = 0.0086  # ramp: half of validated 0.0172 (16.4% annualised)
+    # mvo_target_vol_daily kept at the fully-validated 0.0172 (32.8% annualised,
+    # matches prod's actual risk level) -- deliberately not run at reduced size;
+    # this is the exact config the validation work covers, at the exact risk
+    # level it was validated at.
+    mvo_target_vol_daily: float = 0.0172  # 32.8% annualised -- matches prod's actual risk level
     mvo_trading_days: int = 365           # annualisation basis (crypto 24/7/365)
     mvo_max_position_weight: float = 0.30 # cap |weight| per asset (frac of equity)
     mvo_max_gross_leverage: float = 4.5   # matches risk-parity's execution-level cap above
