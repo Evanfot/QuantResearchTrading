@@ -500,99 +500,102 @@ def main():
 
         # ── Trading intent task (daily) ────────────────────────────────────────
         if is_trading_intent_due(now, state):
-            logger.info("[intent] computing trading intent")
-            config = StrategyConfig()
-            prov = strategy_registry.provenance(config)
-            intent = init_intent(mode="live", strategy_name=prov["strategy"], run_id=run_id, provenance=prov)
-            logger.info(f"[intent] strategy={prov['strategy']} commit={prov['git_commit']} "
-                        f"dirty={prov['git_dirty']} config_hash={prov['config_hash']}")
-            state = load_state(STATE_PATH)
-            positions = get_state_positions(state)
             try:
-                exchange_state = run_exchange_state()
+                logger.info("[intent] computing trading intent")
+                config = StrategyConfig()
+                prov = strategy_registry.provenance(config)
+                intent = init_intent(mode="live", strategy_name=prov["strategy"], run_id=run_id, provenance=prov)
+                logger.info(f"[intent] strategy={prov['strategy']} commit={prov['git_commit']} "
+                            f"dirty={prov['git_dirty']} config_hash={prov['config_hash']}")
+                state = load_state(STATE_PATH)
+                positions = get_state_positions(state)
+                try:
+                    exchange_state = run_exchange_state()
+                except Exception:
+                    logger.warning("can't fetch exchange state for intent, using latest cached")
+                    exchange_state = read_latest_exchange_state()
+
+                meta = read_latest_meta()
+                top = get_latest_market_cap()
+                hl = get_hl_coins()
+                universe, symbol_index = get_universe(top, hl, state.get("universe"))
+
+                conn = duckdb.connect(db_path)
+                hyperliquid_prices = get_ohlcv(conn)
+                ltps = update_ltps()
+                latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
+                prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
+
+                # If every coin dropped out of the universe (e.g. a data outage), prices/
+                # returns_adj are zero-column frames. Downstream signal functions assume
+                # at least one column -- ewm(...).corr() alone hits three different empty-
+                # input edge cases in pandas depending on how far the pipeline gets, so
+                # this is one guard for the whole class rather than patching each one.
+                if prices.shape[1] == 0:
+                    logger.warning("[intent] universe is empty — skipping, will retry next tick")
+                    continue
+
+                tradable = list(prices.columns)
+                symbol_index = {s: i for i, s in enumerate(tradable)}
+
+                intent["universe"]["tradable"] = tradable
+                intent = initialise_asset_intent(intent, tradable)
+                account_equity = get_account_equity(exchange_state)
+                intent["portfolio"]["equity_usd"] = account_equity
+                intent["portfolio"]["equity_used_for_sizing"] = account_equity
+                intent["portfolio"]["maintenance_margin"] = exchange_state["crossMaintenanceMarginUsed"]
+                intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state["marginSummary"]["totalNtlPos"]
+                intent = add_ltp_to_intent(intent, latest_view)
+
+                ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
+                breakout_forecast = breakout(prices, config.breakout_window)
+                bollinger_forecast = scaled_bollinger(prices, param=config.bollinger_window, scalar=1)
+
+                o, h, l, c_alpha, v = load_ohlcv_for_alphas(universe)
+                o        = o.reindex(index=prices.index, columns=prices.columns)
+                h        = h.reindex(index=prices.index, columns=prices.columns)
+                l        = l.reindex(index=prices.index, columns=prices.columns)
+                v        = v.reindex(index=prices.index, columns=prices.columns)
+                c_alpha  = c_alpha.reindex(index=prices.index, columns=prices.columns)
+                r_alpha  = np.log(c_alpha).diff()
+
+                alpha006_forecast = alpha006(o, v)
+                alpha014_forecast = alpha014(o, v, r_alpha)
+                alpha020_forecast = alpha020(o, h, l, c_alpha)
+
+                mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast, alpha006_forecast, alpha014_forecast, alpha020_forecast], axis=0)
+                vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
+                cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
+
+                for symbol in tradable:
+                    intent["assets"][symbol]["model"]["vol_1d"] = float(vo[-1, symbol_index[symbol]])
+                    intent["assets"][symbol]["model"]["signal"] = {
+                        "mu": float(mu[-1, symbol_index[symbol]]),
+                        "sub_signals": {
+                            "ewmac": float(ewmac_forecast[-1, symbol_index[symbol]]),
+                            "breakout": float(breakout_forecast[-1, symbol_index[symbol]]),
+                            "bollinger": float(bollinger_forecast[-1, symbol_index[symbol]]),
+                            "alpha014": float(alpha014_forecast[-1, symbol_index[symbol]]),
+                            "alpha020": float(alpha020_forecast[-1, symbol_index[symbol]]),
+                        },
+                    }
+                intent["risk_inputs"]["correlation_matrix"] = cor.loc[prices.index[-1]].to_dict()
+
+                # Snapshot the pre-sizing intent so the shadow runs off identical inputs.
+                shadow_base = copy.deepcopy(intent) if SHADOW_SIZING else None
+
+                run_live(prices, mu, vo, cor, positions, ltps, intent, config, latest_view, logger, intent_logger)
+
+                if SHADOW_SIZING:
+                    run_shadow_sizing(prices, mu, vo, cor, positions, ltps, shadow_base, config,
+                                      latest_view, logger, shadow_intent_logger)
+
+                state["last_trading_intent_run_id"] = run_id
+                state["universe"] = universe
+                save_state(state, STATE_PATH)
+                logger.info(f"[intent] complete, run_id={run_id}, universe size={len(universe)}")
             except Exception:
-                logger.warning("can't fetch exchange state for intent, using latest cached")
-                exchange_state = read_latest_exchange_state()
-
-            meta = read_latest_meta()
-            top = get_latest_market_cap()
-            hl = get_hl_coins()
-            universe, symbol_index = get_universe(top, hl, state.get("universe"))
-
-            conn = duckdb.connect(db_path)
-            hyperliquid_prices = get_ohlcv(conn)
-            ltps = update_ltps()
-            latest_view = pd.read_csv("data/snapshots/mids.csv", index_col=0)
-            prices, returns_adj = get_final_pricing(hyperliquid_prices, universe, latest_view)
-
-            # If every coin dropped out of the universe (e.g. a data outage), prices/
-            # returns_adj are zero-column frames. Downstream signal functions assume
-            # at least one column -- ewm(...).corr() alone hits three different empty-
-            # input edge cases in pandas depending on how far the pipeline gets, so
-            # this is one guard for the whole class rather than patching each one.
-            if prices.shape[1] == 0:
-                logger.warning("[intent] universe is empty — skipping, will retry next tick")
-                continue
-
-            tradable = list(prices.columns)
-            symbol_index = {s: i for i, s in enumerate(tradable)}
-
-            intent["universe"]["tradable"] = tradable
-            intent = initialise_asset_intent(intent, tradable)
-            account_equity = get_account_equity(exchange_state)
-            intent["portfolio"]["equity_usd"] = account_equity
-            intent["portfolio"]["equity_used_for_sizing"] = account_equity
-            intent["portfolio"]["maintenance_margin"] = exchange_state["crossMaintenanceMarginUsed"]
-            intent["portfolio"]["gross_exposure_pre_rebal"] = exchange_state["marginSummary"]["totalNtlPos"]
-            intent = add_ltp_to_intent(intent, latest_view)
-
-            ewmac_forecast = ewmac(returns_adj, config.ewmac_fast)
-            breakout_forecast = breakout(prices, config.breakout_window)
-            bollinger_forecast = scaled_bollinger(prices, param=config.bollinger_window, scalar=1)
-
-            o, h, l, c_alpha, v = load_ohlcv_for_alphas(universe)
-            o        = o.reindex(index=prices.index, columns=prices.columns)
-            h        = h.reindex(index=prices.index, columns=prices.columns)
-            l        = l.reindex(index=prices.index, columns=prices.columns)
-            v        = v.reindex(index=prices.index, columns=prices.columns)
-            c_alpha  = c_alpha.reindex(index=prices.index, columns=prices.columns)
-            r_alpha  = np.log(c_alpha).diff()
-
-            alpha006_forecast = alpha006(o, v)
-            alpha014_forecast = alpha014(o, v, r_alpha)
-            alpha020_forecast = alpha020(o, h, l, c_alpha)
-
-            mu = np.mean([bollinger_forecast, ewmac_forecast, breakout_forecast, alpha006_forecast, alpha014_forecast, alpha020_forecast], axis=0)
-            vo = prices.pct_change().ewm(com=config.vo_window, min_periods=20).std().values
-            cor = returns_adj.ewm(com=config.correlation, min_periods=config.correlation).corr()
-
-            for symbol in tradable:
-                intent["assets"][symbol]["model"]["vol_1d"] = float(vo[-1, symbol_index[symbol]])
-                intent["assets"][symbol]["model"]["signal"] = {
-                    "mu": float(mu[-1, symbol_index[symbol]]),
-                    "sub_signals": {
-                        "ewmac": float(ewmac_forecast[-1, symbol_index[symbol]]),
-                        "breakout": float(breakout_forecast[-1, symbol_index[symbol]]),
-                        "bollinger": float(bollinger_forecast[-1, symbol_index[symbol]]),
-                        "alpha014": float(alpha014_forecast[-1, symbol_index[symbol]]),
-                        "alpha020": float(alpha020_forecast[-1, symbol_index[symbol]]),
-                    },
-                }
-            intent["risk_inputs"]["correlation_matrix"] = cor.loc[prices.index[-1]].to_dict()
-
-            # Snapshot the pre-sizing intent so the shadow runs off identical inputs.
-            shadow_base = copy.deepcopy(intent) if SHADOW_SIZING else None
-
-            run_live(prices, mu, vo, cor, positions, ltps, intent, config, latest_view, logger, intent_logger)
-
-            if SHADOW_SIZING:
-                run_shadow_sizing(prices, mu, vo, cor, positions, ltps, shadow_base, config,
-                                  latest_view, logger, shadow_intent_logger)
-
-            state["last_trading_intent_run_id"] = run_id
-            state["universe"] = universe
-            save_state(state, STATE_PATH)
-            logger.info(f"[intent] complete, run_id={run_id}, universe size={len(universe)}")
+                logger.warning("[intent] failed", exc_info=True)
         elif first_run:
             last_id = state.get("last_trading_intent_run_id", "never")
             logger.info(f"[intent] not due (last: {last_id}, scheduled: {TRADING_INTENT_HOUR_UTC:02d}:{TRADING_INTENT_MINUTE_UTC:02d} UTC)")
