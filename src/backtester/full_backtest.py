@@ -26,11 +26,14 @@ class StrategyConfig:
     max_gross_leverage: float = 4.5  # hard cap on sum(|target_weight|); book scales down proportionally if breached
 
     # ── Sizing model selection ──────────────────────────────────────────────
-    # Default stays "risk_parity" -- this lands as a no-op; flip to "mvo" only
-    # after a real shadow-validation period on this exact code (see
-    # docs/decisions/202609-mvo-transition-investigation.md). The other model
-    # then runs as the shadow automatically (SHADOW_SIZING=true).
-    sizing_model: str = "risk_parity"     # "mvo" | "risk_parity"
+    # Promoted 2026-09-22 (docs/decisions/202609-mvo-transition-investigation.md)
+    # after holdout + walk-forward + as-of-2025-12-31 time-robustness validation,
+    # ~1 week of clean shadow data (shorter than the "few weeks" originally
+    # planned -- a known, accepted tradeoff, not an oversight). SHADOW_SIZING
+    # stays on so risk-parity automatically becomes the shadow from the moment
+    # this goes live, giving a same-day rollback comparison. Revert = flip this
+    # back to "risk_parity"; no other code change needed.
+    sizing_model: str = "mvo"              # "mvo" | "risk_parity"
     # MVO (max-Sharpe + vol-target) params — see full_backtest_mvo.MVOConfig.
     # Values are the holdout-validated candidate, not feature/mvo's original
     # defaults (gamma=0.1, lookback=252, target_vol_daily=0.022): the original
@@ -38,6 +41,11 @@ class StrategyConfig:
     # L2 regularisation + a shorter covariance window fixed that and
     # generalised across a 12-block walk-forward and an independent
     # as-of-2025-12-31 time-robustness check.
+    #
+    # mvo_target_vol_daily kept at the fully-validated 0.0172 (32.8% annualised,
+    # matches prod's actual risk level) -- deliberately not run at reduced size;
+    # this is the exact config the validation work covers, at the exact risk
+    # level it was validated at.
     mvo_target_vol_daily: float = 0.0172  # 32.8% annualised -- matches prod's actual risk level
     mvo_trading_days: int = 365           # annualisation basis (crypto 24/7/365)
     mvo_max_position_weight: float = 0.30 # cap |weight| per asset (frac of equity)

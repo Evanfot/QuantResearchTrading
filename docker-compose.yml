@@ -11,12 +11,14 @@ services:
       - .env
     environment:
       # Compute + log the *other* sizing model to a side file for parallel
-      # validation, without ever feeding it to the executor -- dormant until
-      # explicitly opted into for shadow-validating MVO. (DRY_RUN is NOT wired
-      # here: src/main.py's DRY_RUN is still a hardcoded constant, not read
-      # from the environment -- exposing it here unwired would be a footgun,
-      # since setting it wouldn't actually do anything.)
-      SHADOW_SIZING: ${SHADOW_SIZING:-false}
+      # validation, without ever feeding it to the executor. Default flipped to
+      # true alongside sizing_model="mvo" (StrategyConfig) so risk-parity
+      # automatically becomes the shadow the moment MVO goes primary -- a
+      # same-day rollback comparison, not something to build after the fact.
+      # (DRY_RUN is NOT wired here: src/main.py's DRY_RUN is still a hardcoded
+      # constant, not read from the environment -- exposing it here unwired
+      # would be a footgun, since setting it wouldn't actually do anything.)
+      SHADOW_SIZING: ${SHADOW_SIZING:-true}
     volumes:
       - ./logs:/app/logs
       - ./state:/app/state
