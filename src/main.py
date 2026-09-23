@@ -277,7 +277,16 @@ def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_vi
     # applied uniformly regardless of sizing_model (docs/decisions/202608-gross-leverage-cap.md).
     target_weights = cap_gross_leverage(target_weights, config.max_gross_leverage, logger)
 
-    target_zeroes = {coin: 0 for coin in set(positions.keys()) - set(target_weights.keys())}
+    # Only coins with an ACTUAL open position (positions[coin] != 0) need a
+    # closing target -- positions.keys() can carry zero-qty entries for coins
+    # that dropped out of the universe a while ago and were never pruned from
+    # state, and including those here made holdings_outside_universe report
+    # coins with no real position to close (delta 0 -> 0, no order, nothing
+    # to act on).
+    target_zeroes = {
+        coin: 0 for coin in set(positions.keys()) - set(target_weights.keys())
+        if positions.get(coin, 0) != 0
+    }
     intent_log["universe"]["holdings_outside_universe"] = list(target_zeroes.keys())
 
     for symbol in target_zeroes:
