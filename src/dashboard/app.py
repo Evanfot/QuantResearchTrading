@@ -13,6 +13,7 @@ import os
 os.chdir(root)
 
 import datetime as dt
+import html
 import numpy as np
 import pandas as pd
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -158,6 +159,34 @@ def load_error_count_24h():
     return count
 
 
+def load_recent_errors(hours=24, limit=20):
+    """Individual ERROR-level entries from logs/errors.log within the last
+    `hours`, most recent first. Only the header line of each entry (timestamp
+    + message) -- multi-line tracebacks that follow a header don't start with
+    a timestamp themselves, so they fail the parse below and are skipped,
+    which is what keeps load_error_count_24h() an entry count rather than a
+    line count too.
+    """
+    path = root / "logs/errors.log"
+    if not path.exists():
+        return []
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    entries = []
+    with open(path) as fh:
+        for line in fh:
+            try:
+                ts = dt.datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S,%f").replace(tzinfo=dt.timezone.utc)
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            rest = line[23:].strip()
+            msg = rest[len("[ERROR] "):] if rest.startswith("[ERROR] ") else rest
+            entries.append((ts, msg))
+    entries.sort(key=lambda x: x[0], reverse=True)
+    return entries[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -215,7 +244,20 @@ def load_day_open_mids():
 
 
 def compute_portfolio_vol(exchange_state, intent):
-    """Annualised portfolio volatility from current position weights and latest intent."""
+    """Annualised portfolio volatility from current position weights and latest intent.
+
+    A coin with too little history for its longer-window correlation estimate
+    (min_periods=64) can still have a valid vol_1d (min_periods=20) -- e.g. a
+    newly-tradable or data-gappy asset -- leaving NaN entries in the
+    correlation matrix for that coin specifically while everything else is
+    fine. NaN propagates silently through the matrix math below (it's a valid
+    float, not an exception, so the try/except doesn't catch it) and poisons
+    the WHOLE portfolio variance even though only one held coin is affected --
+    surfaced live 2026-09-23 as "NaN vol %" on the dashboard right after the
+    first MVO-sized trade picked up a data-gappy coin as a real position.
+    Both vol_1d and the correlation submatrix are explicitly checked for NaN
+    below, dropping only the offending coin(s) rather than the whole figure.
+    """
     try:
         account_value = get_account_equity(exchange_state)
         if account_value <= 0:
@@ -225,6 +267,7 @@ def compute_portfolio_vol(exchange_state, intent):
             coin: data["model"]["vol_1d"]
             for coin, data in intent.get("assets", {}).items()
             if data.get("model", {}).get("vol_1d") is not None
+            and not np.isnan(data["model"]["vol_1d"])
         }
         corr_raw = intent.get("risk_inputs", {}).get("correlation_matrix", {})
         if not corr_raw or not vol_per_coin:
@@ -242,6 +285,19 @@ def compute_portfolio_vol(exchange_state, intent):
             weights[pos["coin"]] = signed_notional / account_value
 
         common = [c for c in weights if c in vol_per_coin and c in corr_df.index]
+
+        # Drop the coin(s) with NaN correlation entries, one at a time (the
+        # worst offender first): a bad coin's NaN shows up in ITS row/col AND
+        # in every OTHER coin's row against it, so dropping every row with any
+        # NaN in one pass over-drops the good coins too -- only the single
+        # actually-bad coin needs to go.
+        while len(common) >= 2:
+            sub = corr_df.loc[common, common]
+            nan_counts = sub.isna().sum(axis=1)
+            if nan_counts.max() == 0:
+                break
+            common = [c for c in common if c != nan_counts.idxmax()]
+
         if len(common) < 2:
             return None
 
@@ -333,6 +389,11 @@ footer{{text-align:center;padding:16px;color:#1e2433;font-size:11px}}
 .scard-lbl{{color:#475569;font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}}
 .scard-val{{font-size:12px;color:#cbd5e1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .scard-sub{{font-size:11px;color:#334155;margin-top:2px}}
+.error-list{{display:flex;flex-direction:column;gap:8px;padding:0 24px 20px}}
+.error-row{{background:#131720;border:1px solid #ef444444;border-radius:8px;padding:10px 14px;display:flex;gap:14px;align-items:baseline}}
+.error-ts{{color:#475569;font-size:10px;white-space:nowrap;flex-shrink:0}}
+.error-msg{{color:#cbd5e1;font-size:12px;overflow-wrap:anywhere}}
+.error-empty{{color:#334155;font-size:12px;padding:0 24px 20px}}
 </style>
 </head>
 <body>
@@ -543,12 +604,27 @@ def build_status_tab(now, state):
         cards = "\n".join(_scard(*i) for i in items)
         return f'<div class="status-grid">\n{cards}\n</div>'
 
+    recent_errors = load_recent_errors(hours=24)
+    if recent_errors:
+        rows = "\n".join(
+            f'<div class="error-row">'
+            f'<div class="error-ts">{ts.strftime("%Y-%m-%d %H:%M:%S")} UTC</div>'
+            f'<div class="error-msg">{html.escape(msg)}</div>'
+            f'</div>'
+            for ts, msg in recent_errors
+        )
+        errors_block = f'<div class="error-list">\n{rows}\n</div>'
+    else:
+        errors_block = '<div class="error-empty">No errors in the last 24h.</div>'
+
     return (
         grid(health_items)
         + '\n<div class="sec-hdr" style="padding:12px 24px 8px">Trading</div>\n'
         + grid(trading_items)
         + '\n<div class="sec-hdr" style="padding:12px 24px 8px">Data</div>\n'
         + grid(data_items)
+        + '\n<div class="sec-hdr" style="padding:12px 24px 8px">Recent Errors (24h)</div>\n'
+        + errors_block
     )
 
 
