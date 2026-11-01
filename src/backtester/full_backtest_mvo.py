@@ -21,63 +21,12 @@ same function drives both the backtest (multiply by AUM) and live sizing
 (``run_live`` consumes the weights directly).
 """
 
-from dataclasses import dataclass
-from typing import Optional
-
 import numpy as np
 import pandas as pd
 from cvx.simulator import Builder
 from pypfopt import EfficientFrontier, objective_functions, risk_models
 
-
-@dataclass
-class MVOConfig:
-    """Parameters for the MVO (max-Sharpe) weighting scheme.
-
-    ``sizing`` selects how the tangency (max-Sharpe) portfolio is *scaled* — both
-    choices share the same direction ``w`` and only differ in leverage:
-
-      * ``"kelly"``      — fractional-Kelly leverage ``kelly_fraction * μ_p/σ_p²``
-      * ``"vol_target"`` — lever the tangency book to hit ``target_vol`` each period
-                            (``lev = target_vol / sqrt(wᵀSw)``)
-    """
-
-    sizing: str = "vol_target"  # "kelly" | "vol_target"
-    gamma: float = 0.1          # L2 regularisation on weights (PyPortfolioOpt)
-    rf: float = 0.15            # risk-free rate used for Kelly excess return
-    kelly_fraction: float = 0.25  # fraction of full-Kelly leverage (sizing="kelly")
-    target_vol_daily: float = 0.022  # daily vol target (sizing="vol_target")
-    trading_days: int = 365     # annualisation basis — crypto trades 24/7/365
-    max_position_weight: Optional[float] = None  # cap on |weight| per asset (frac of equity)
-    max_gross_leverage: float = 4.5  # cap on sum(|w|); matches StrategyConfig's live cap (dcb00c2/f50dfc5)
-    lookback: int = 252         # trailing window (rows) for covariance estimation
-    min_periods: int = 60       # min non-NaN rows an asset needs to be included
-    weight_bounds: tuple = (None, None)  # (None, None) => long/short allowed
-
-    @property
-    def target_vol_annual(self) -> float:
-        """Target vol on the same annualisation basis as the covariance."""
-        return self.target_vol_daily * (self.trading_days ** 0.5)
-
-
-@dataclass
-class MVOIntent:
-    """Per-period MVO sizing result.
-
-    All per-asset arrays are aligned to the *masked* (valid-price) assets, in the
-    same order as ``price_window.columns[mask]``. ``target_weight`` is a fraction
-    of equity (post-cap) — multiply by AUM for cash positions, or use directly as
-    a live target weight.
-    """
-
-    target_weight: np.ndarray    # final weight per masked asset (fraction of equity)
-    tangency_weight: np.ndarray  # max-Sharpe direction w (sums to 1 over usable assets)
-    capped: np.ndarray           # bool: did the per-asset cap bind for this asset?
-    mask: np.ndarray
-    leverage: float              # leverage applied to the tangency book
-    expected_vol: float          # model's expected annualised vol of the book
-    gross: float                 # sum(|target_weight|)
-    portfolio_mu: float          # tangency expected excess return (w·(μ−rf))
+from src.strategy.config import MVOConfig, MVOIntent
 
 
 def _flat_intent(mask: np.ndarray, n_valid: int) -> MVOIntent:
@@ -203,6 +152,16 @@ def run_backtest_mvo(prices: pd.DataFrame, mu: np.ndarray, config: MVOConfig):
             config=config,
         )
         builder.cashposition = mvo_intent.target_weight * state.aum
-        builder.aum = state.aum
+
+        if config.add_commission:
+            # state.trades (units) was just computed by the cashposition
+            # setter above as new_position - old_position; NaN on day 0 only
+            # (no prior position to diff against) -> treat as flat-start, 0 cost.
+            traded_dollars = np.abs(state.trades.fillna(0.0).to_numpy() * builder.current_prices).sum()
+            commission = traded_dollars * (config.commission_bps / 1e4)
+        else:
+            commission = 0
+
+        builder.aum = state.aum - commission
 
     return builder.build()

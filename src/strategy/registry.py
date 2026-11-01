@@ -34,10 +34,18 @@ _CONFIG_FIELDS = {
         "ewmac_fast", "breakout_window", "bollinger_window", "vo_window", "correlation",
     ),
     "mvo": (
-        "mvo_target_vol_daily", "mvo_trading_days", "mvo_max_position_weight",
-        "mvo_gamma", "mvo_rf", "mvo_kelly_fraction", "mvo_lookback", "mvo_min_periods",
+        "mvo.target_vol_daily", "mvo.trading_days", "mvo.max_position_weight",
+        "mvo.gamma", "mvo.rf", "mvo.kelly_fraction", "mvo.lookback", "mvo.min_periods",
     ),
 }
+
+
+def _resolve_attr(config: Any, dotted: str) -> Any:
+    """Resolve a (possibly dotted, e.g. "mvo.gamma") attribute path on ``config``."""
+    obj = config
+    for part in dotted.split("."):
+        obj = getattr(obj, part, None)
+    return obj
 
 
 @lru_cache(maxsize=1)
@@ -98,7 +106,7 @@ def config_hash(config) -> str:
     """Stable short hash of the resolved sizing params actually used."""
     sm = getattr(config, "sizing_model", None)
     fields = _CONFIG_FIELDS.get(sm, ())
-    payload = "|".join(f"{f}={getattr(config, f, None)!r}" for f in fields)
+    payload = "|".join(f"{f}={_resolve_attr(config, f)!r}" for f in fields)
     return hashlib.sha1(payload.encode()).hexdigest()[:12]
 
 

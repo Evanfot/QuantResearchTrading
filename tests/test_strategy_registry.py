@@ -1,7 +1,7 @@
 """Tests for the strategy registry + run provenance."""
 import pytest
 
-from src.backtester.full_backtest import StrategyConfig
+from src.strategy.config import StrategyConfig
 from src.strategy import registry
 
 
@@ -52,7 +52,7 @@ def test_config_hash_is_deterministic_and_sensitive():
     a = StrategyConfig(); a.sizing_model = "mvo"
     b = StrategyConfig(); b.sizing_model = "mvo"
     assert registry.config_hash(a) == registry.config_hash(b)
-    b.mvo_target_vol_daily = a.mvo_target_vol_daily * 2
+    b.mvo.target_vol_daily = a.mvo.target_vol_daily * 2
     assert registry.config_hash(a) != registry.config_hash(b)
 
 

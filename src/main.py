@@ -11,8 +11,9 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from src.backtester.full_backtest import StrategyConfig, StrategyIntent, compute_strategy
-from src.backtester.full_backtest_mvo import MVOConfig, MVOIntent, compute_strategy_mvo
+from src.backtester.full_backtest import compute_strategy
+from src.backtester.full_backtest_mvo import compute_strategy_mvo
+from src.strategy.config import StrategyConfig, StrategyIntent, MVOConfig, MVOIntent
 from src.strategy import registry as strategy_registry
 from src.data import db_path, get_final_pricing, get_hyperliquid_trading_universe, get_ohlcv, load_ohlcv_for_alphas
 from src.execution import cap_gross_leverage, classify_order_responses, generate_readable_summary, get_execution_plan, get_order_intention, preflight_check
@@ -195,22 +196,6 @@ def log_strategy_intent(
         intent_log["assets"][symbol]["model"]["target_weight"] = float(weights[i])
 
 
-def mvo_config_from_strategy(config: StrategyConfig) -> MVOConfig:
-    """Build the MVO core config from the production StrategyConfig."""
-    return MVOConfig(
-        sizing="vol_target",
-        gamma=config.mvo_gamma,
-        rf=config.mvo_rf,
-        kelly_fraction=config.mvo_kelly_fraction,
-        target_vol_daily=config.mvo_target_vol_daily,
-        trading_days=config.mvo_trading_days,
-        max_position_weight=config.mvo_max_position_weight,
-        max_gross_leverage=config.mvo_max_gross_leverage,
-        lookback=config.mvo_lookback,
-        min_periods=config.mvo_min_periods,
-    )
-
-
 def log_strategy_intent_mvo(
     intent_log: Dict[str, Any],
     prices: pd.DataFrame,
@@ -250,11 +235,10 @@ def run_live(prices, mu, vo, cor, positions, ltps, intent_log, config, latest_vi
     tradable_symbols = prices.columns[mask]
 
     if config.sizing_model == "mvo":
-        mvo_config = mvo_config_from_strategy(config)
         mvo_intent = compute_strategy_mvo(
-            price_window=prices.loc[:t], mu_row=mu[-1], mask=mask, config=mvo_config
+            price_window=prices.loc[:t], mu_row=mu[-1], mask=mask, config=config.mvo
         )
-        log_strategy_intent_mvo(intent_log, prices, mvo_intent, mvo_config)
+        log_strategy_intent_mvo(intent_log, prices, mvo_intent, config.mvo)
         target_weights = {
             symbol: float(w)
             for symbol, w in zip(tradable_symbols, mvo_intent.target_weight)
