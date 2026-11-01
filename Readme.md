@@ -46,13 +46,13 @@ Testnet services are defined under the `testnet` profile and write logs to `./lo
 
 ```bash
 # Start testnet trader only
-docker-compose --profile testnet up trader-testnet
+docker compose --profile testnet up trader-testnet
 
 # Start both testnet trader and dashboard (available on port 8051)
-docker-compose --profile testnet up
+docker compose --profile testnet up
 ```
 
-The default `docker-compose up` (no profile) only starts mainnet services.
+The default `docker compose up` (no profile) only starts mainnet services.
 
 ### Manually triggering tasks
 
