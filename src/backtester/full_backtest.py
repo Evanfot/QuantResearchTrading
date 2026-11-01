@@ -20,20 +20,9 @@ def compute_strategy(
     expected_vo = np.nan_to_num(vo[mask])
 
     risk_position = solve(matrix, expected_mu) / inv_a_norm(expected_mu, matrix)
-    # Two independent ways an asset in `mask` (has a price) can still be "cold":
-    # (1) its own vol EWM hasn't warmed up yet -- nan_to_num(vo) turns that into a
-    #     literal 0, and dividing by it produces inf/NaN.
-    # (2) tinycta's solve() already handles a cold correlation ROW gracefully (it
-    #     solves only the warm submatrix, per-asset), but leaves NaN in
-    #     risk_position for that asset -- e.g. it has enough history for its own
-    #     vol (shorter window) but not yet for the pairwise correlation (longer
-    #     window). Either NaN here is dangerous for a DIFFERENT reason than just
-    #     "this one asset doesn't get a position": a NaN entry anywhere in
-    #     target_pos poisons `gross = np.abs(weight).sum()` downstream in
-    #     run_backtest to NaN, and `NaN > max_gross_leverage` is always False --
-    #     silently disabling the gross-leverage cap for every OTHER (perfectly
-    #     warm) asset on that bar. Guard against both the same way: no reliable
-    #     risk estimate yet == no position, not "divide and hope".
+    #     If vo/corr is NaN, target_pos is NaN, but `gross = np.abs(weight).sum()` downstream returns NaN and
+    #    `NaN > max_gross_leverage` is always False --
+    #     silently disabling the gross-leverage cap, so explicitly set target pos to zero
     valid = (expected_vo > 0) & np.isfinite(risk_position)
     target_pos = np.zeros_like(risk_position)
     target_pos[valid] = config.position_multiplier * risk_position[valid] / expected_vo[valid]
@@ -67,12 +56,10 @@ def run_backtest(prices, mu, vo, cor, config: StrategyConfig):
             config=config,
         )
 
-        # Rescale target_position (position_multiplier-scaled, fixed-dollar
-        # units sized for the ignore_small logic inside compute_strategy) into a
+        # Rescale target_position  into a
         # fraction-of-equity weight via conversion_factor, then apply the same
-        # gross-leverage backstop prod enforces uniformly regardless of
-        # sizing_model (cap_gross_leverage in src/main.py / src/execution.py).
         # Without this, the backtest priced the book as a fixed-dollar
+        # gross-leverage backstop as prod enforces (cap_gross_leverage in src/main.py / src/execution.py).
         # position against the $1,000 starting AUM -- uncapped, and scaled by
         # position_multiplier instead of weight_multiplier -- which doesn't
         # track prod's actual risk level at all.
@@ -94,10 +81,7 @@ def run_backtest(prices, mu, vo, cor, config: StrategyConfig):
         # at this bar's prices), keeps both sides in the same units.
         if config.threshold_trade and n > 0:
             # builder.position is full-width (all of prices.columns); current_prices
-            # is already masked down to this bar's valid assets (state.assets) --
-            # mask them the same way before combining, or this raises a shape
-            # mismatch on close to every bar (any time mask.sum() < len(prices.columns),
-            # which is most bars before every universe coin has listed).
+            # is already masked down to this bar's valid assets (state.assets)
             yesterday_cashposition = builder.position[mask].to_numpy() * builder.current_prices
             below_threshold = np.abs(target_cashposition - yesterday_cashposition) < config.small_threshold
             target_cashposition[below_threshold] = yesterday_cashposition[below_threshold]
@@ -106,8 +90,6 @@ def run_backtest(prices, mu, vo, cor, config: StrategyConfig):
 
         if config.add_commission:
             # state.trades (units) was just computed by the cashposition
-            # setter above as new_position - old_position; NaN on day 0 only
-            # (no prior position to diff against) -> treat as flat-start, 0 cost.
             traded_dollars = np.abs(state.trades.fillna(0.0).to_numpy() * builder.current_prices).sum()
             commission = traded_dollars * (config.commission_bps / 1e4)
         else:
