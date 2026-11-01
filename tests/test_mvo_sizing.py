@@ -6,11 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.backtester.full_backtest_mvo import (
-    MVOConfig,
-    MVOIntent,
-    compute_strategy_mvo,
-)
+from src.backtester.full_backtest_mvo import compute_strategy_mvo
+from src.strategy.config import MVOConfig, MVOIntent
 
 
 def _synthetic(n_periods=300, n_assets=6, seed=0):
