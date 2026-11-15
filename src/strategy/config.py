@@ -24,7 +24,7 @@ class MVOConfig:
 
     sizing: str = "vol_target"  # "kelly" | "vol_target"
     gamma: float = 0.1          # L2 regularisation on weights (PyPortfolioOpt)
-    rf: float = 0.15            # risk-free rate used for Kelly excess return
+    rf: float = 0.0             # risk-free rate used for Kelly excess return
     kelly_fraction: float = 0.25  # fraction of full-Kelly leverage (sizing="kelly")
     target_vol_daily: float = 0.022  # daily vol target (sizing="vol_target")
     trading_days: int = 365     # annualisation basis — crypto trades 24/7/365
@@ -111,7 +111,7 @@ class StrategyConfig:
         max_position_weight=0.30,  # cap |weight| per asset (frac of equity)
         max_gross_leverage=4.5,    # matches risk-parity's execution-level cap above
         gamma=1.0,
-        rf=0.15,
+        rf=0.0,
         kelly_fraction=0.25,
         lookback=90,
         min_periods=60,

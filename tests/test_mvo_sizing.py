@@ -66,18 +66,54 @@ def test_masked_assets_excluded_and_zero():
     assert out.target_weight.shape == (int(mask.sum()),)  # masked-length output
 
 
-def test_degenerate_universe_stays_flat():
+def test_degenerate_universe_stays_flat(caplog):
     prices, mu, _ = _synthetic(n_assets=6)
     mask = np.zeros(prices.shape[1], dtype=bool)
     mask[0] = True  # only one valid asset -> cannot form a covariance
-    out = compute_strategy_mvo(prices, mu[-1], mask, MVOConfig())
+    with caplog.at_level("ERROR"):
+        out = compute_strategy_mvo(prices, mu[-1], mask, MVOConfig())
     assert np.allclose(out.target_weight, 0.0)
     assert out.leverage == 0.0
+    assert "flattening" in caplog.text  # silent flattens must log
 
 
-def test_insufficient_history_stays_flat():
+def test_insufficient_history_stays_flat(caplog):
     prices, mu, _ = _synthetic(n_periods=300)
     prices.iloc[:, 1:] = np.nan  # only one asset has history
     mask = np.ones(prices.shape[1], dtype=bool)
-    out = compute_strategy_mvo(prices, mu[-1], mask, MVOConfig(min_periods=60))
+    with caplog.at_level("ERROR"):
+        out = compute_strategy_mvo(prices, mu[-1], mask, MVOConfig(min_periods=60))
     assert np.allclose(out.target_weight, 0.0)
+    assert "flattening" in caplog.text
+
+
+def test_no_asset_beats_rf_uses_min_variance_instead_of_flat(caplog):
+    """A broad selloff pushing every asset's mu below rf must size via
+    min-variance, not flatten -- max_sharpe would raise in this case."""
+    prices, mu, _ = _synthetic()
+    mask = np.ones(prices.shape[1], dtype=bool)
+    cfg = MVOConfig(rf=0.15, max_gross_leverage=1e9)
+    bearish_mu = np.full(prices.shape[1], -1.0)  # every asset well below rf
+    with caplog.at_level("WARNING"):
+        out = compute_strategy_mvo(prices, bearish_mu, mask, cfg)
+    assert not np.allclose(out.target_weight, 0.0)  # took min-variance exposure, didn't flatten
+    assert np.isfinite(out.target_weight).all()
+    assert "min-variance" in caplog.text
+
+
+def test_optimizer_failure_stays_flat_and_logs(caplog, monkeypatch):
+    """A solver/library exception must flatten *and* log, not fail silently."""
+    prices, mu, _ = _synthetic()
+    mask = np.ones(prices.shape[1], dtype=bool)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("synthetic solver failure")
+
+    monkeypatch.setattr(
+        "src.backtester.full_backtest_mvo.risk_models.CovarianceShrinkage", _boom
+    )
+    with caplog.at_level("ERROR"):
+        out = compute_strategy_mvo(prices, mu[-1], mask, MVOConfig())
+    assert np.allclose(out.target_weight, 0.0)
+    assert "flattening" in caplog.text
+    assert "synthetic solver failure" in caplog.text
